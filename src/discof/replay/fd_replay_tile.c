@@ -180,6 +180,86 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   return l;
 }
 
+/* Returns 1 if the replay tile is healthy: caught up and not falling
+   behind turbine by more than 12 slots. */
+
+static inline int
+wait_info_healthy( int caught_up, ulong catch_up_max_fec_slot, ulong reset_slot ) {
+  ulong turbine_slot = catch_up_max_fec_slot==ULONG_MAX ? 0UL : catch_up_max_fec_slot;
+  ulong health_reset = reset_slot==ULONG_MAX            ? 0UL : reset_slot;
+  return caught_up && !( turbine_slot>health_reset && turbine_slot-health_reset>12UL );
+}
+
+/* Next slot at or after from that we lead, ULONG_MAX if none is in the
+   tracked schedules.  The scan is slot by slot, hence the cache over
+   [next_leader_query_start, next_leader_query_slot]; a regressing from
+   rescans.  Set the start to ULONG_MAX to invalidate. */
+
+static ulong
+query_next_leader_slot( fd_replay_tile_t * ctx,
+                        ulong              from ) {
+  if( FD_UNLIKELY( ctx->next_leader_query_start==ULONG_MAX ||
+                   from<ctx->next_leader_query_start       ||
+                   from>ctx->next_leader_query_slot        ) ) {
+    ctx->next_leader_query_start = from;
+    ctx->next_leader_query_slot  = fd_multi_epoch_leaders_get_next_slot( ctx->mleaders, from, ctx->identity_pubkey );
+  }
+  return ctx->next_leader_query_slot;
+}
+
+/* refresh_epoch_info republishes the epoch fields wait_info exposes.
+   Call wherever reset_slot moves. */
+
+static void
+refresh_epoch_info( fd_replay_tile_t * ctx,
+                    fd_bank_t const *  bank,
+                    ulong              slot ) {
+  fd_epoch_schedule_t const * sched = &bank->f.epoch_schedule;
+  ulong ep = fd_slot_to_epoch( sched, slot, NULL );
+  ctx->epoch_end_slot  = fd_epoch_slot0( sched, ep ) + fd_epoch_slot_cnt( sched, ep ) - 1UL;
+  ctx->slots_per_epoch = sched->slots_per_epoch;
+  ctx->ns_per_slot     = bank->f.slot_params.ns_per_slot;
+}
+
+/* wait_info_publish writes the wait_info topology object so the wait
+   command can read a consistent snapshot without touching metrics. */
+
+static void
+wait_info_publish( fd_replay_tile_t * ctx ) {
+  if( FD_UNLIKELY( !ctx->wait_info ) ) return; /* not in this topology */
+
+  /* Not ctx->next_leader_slot: it parks at ULONG_MAX until the
+     consensus tile answers.  Same `from` as process_tower_slot_done,
+     so the two share the query cache. */
+
+  ulong highwater = fd_ulong_if( ctx->highwater_leader_slot==ULONG_MAX, 0UL, ctx->highwater_leader_slot );
+  ulong from = fd_ulong_max( ctx->reset_slot==ULONG_MAX ? 0UL : ctx->reset_slot+1UL,
+                             fd_ulong_if( !highwater, 0UL, highwater+1UL ) );
+  int   next_leader_known = !!fd_multi_epoch_leaders_get_leader_for_slot( ctx->mleaders, from );
+  ulong nl                = query_next_leader_slot( ctx, from );
+  ulong next_leader       = nl==ULONG_MAX ? 0UL : nl;
+  int   healthy           = wait_info_healthy( ctx->caught_up, ctx->catch_up_max_fec_slot, ctx->reset_slot );
+
+  fd_wait_info_write_begin( ctx->wait_info );
+  ctx->wait_info->info.caught_up                  = healthy;
+  ctx->wait_info->info.reset_slot                 = ctx->reset_slot==ULONG_MAX ? 0UL : ctx->reset_slot;
+  ctx->wait_info->info.tip_slot                   = ctx->catch_up_max_fec_slot==ULONG_MAX ? 0UL : ctx->catch_up_max_fec_slot;
+  ctx->wait_info->info.leader_highwater_slot      = highwater;
+  ctx->wait_info->info.next_leader_known          = next_leader_known;
+  ctx->wait_info->info.next_leader_slot           = ctx->leader_bank ? ctx->leader_bank->f.slot : next_leader;
+  ctx->wait_info->info.leader_slot                = ctx->leader_bank ? ctx->leader_bank->f.slot : 0UL;
+  ctx->wait_info->info.epoch_end_slot             = ctx->epoch_end_slot;
+  ctx->wait_info->info.slots_per_epoch            = ctx->slots_per_epoch;
+  ctx->wait_info->info.ns_per_slot                = ctx->ns_per_slot;
+  ctx->wait_info->info.delinquent_known           = ctx->delinquent_known;
+  ctx->wait_info->info.delinquent_stake_lamports  = ctx->delinquent_stake_lamports;
+  ctx->wait_info->info.cluster_active_stake_lamports = ctx->cluster_active_stake_lamports;
+  ctx->wait_info->info.snap_active                = ctx->snapmk.active;
+  ctx->wait_info->info.snap_finished_full         = ctx->snapmk.snap_finished_full;
+  ctx->wait_info->info.snap_finished_incr         = ctx->snapmk.snap_finished_incr;
+  fd_wait_info_write_end( ctx->wait_info );
+}
+
 static inline void
 metrics_write( fd_replay_tile_t * ctx ) {
   fd_accdb_flush_metrics( ctx->accdb );
@@ -263,7 +343,19 @@ metrics_write( fd_replay_tile_t * ctx ) {
   FD_MGAUGE_ENUM_COPY( REPLAY, PROGCACHE_CLASS_MAX,  pc_class_max  );
 
   FD_ACCDB_METRICS_WRITE( REPLAY, fd_accdb_metrics( ctx->accdb ) );
+
+  wait_info_publish( ctx );
 }
+
+/* Agave: delinquent once the last vote is this far behind.
+   https://github.com/anza-xyz/agave/blob/v4.2.1/rpc-client-types/src/request.rs#L166 */
+
+#define DELINQUENT_VALIDATOR_SLOT_DISTANCE 128UL
+
+/* Both stake sums sample: 128 slot resolution, read at 1 Hz.  Stamping
+   does not, it is the per block vote evidence. */
+
+#define DELINQUENT_SAMPLE_SLOTS 32UL
 
 static ushort
 replay_voter_rank( fd_replay_tile_t * ctx,
@@ -294,6 +386,115 @@ replay_voter_rank( fd_replay_tile_t * ctx,
   return USHORT_MAX;
 }
 
+/* Returns 1 if the rank's last observed vote is recent enough. */
+
+static inline int
+ag_rank_is_current( ulong last_settled, ulong rank_last_voted ) {
+  return fd_ulong_sat_sub( last_settled, rank_last_voted )<DELINQUENT_VALIDATOR_SLOT_DISTANCE;
+}
+
+/* ag_delinquent_epoch_roll clears the rank table when the epoch
+   advances and raises the settled watermark.  Ranks are remapped across
+   the rollover, so the previous epoch's figure no longer describes the
+   current stake set and reads unknown until a sample repopulates the
+   table.  The watermark cannot regress. */
+
+static void
+ag_delinquent_epoch_roll( fd_replay_tile_t * ctx,
+                          ulong              reward_slot,
+                          ulong              reward_epoch ) {
+  if( FD_UNLIKELY( ctx->ag_last_voted_epoch==ULONG_MAX ||
+                   reward_epoch>ctx->ag_last_voted_epoch ) ) {
+    fd_memset( ctx->ag_last_voted, 0, sizeof(ctx->ag_last_voted) );
+    ctx->ag_last_voted_epoch = reward_epoch;
+    ctx->delinquent_known    = 0;
+  }
+  ctx->ag_last_settled = fd_ulong_max( ctx->ag_last_settled, reward_slot );
+}
+
+/* ag_update_delinquent stamps the reward cert's signers into
+   ag_last_voted and recomputes delinquent stake.  Alpenglow-only:
+   Tower keeps last_vote_slot current through vote transactions. */
+
+static void
+ag_update_delinquent( fd_replay_tile_t *   ctx,
+                      fd_bank_t const *    bank,
+                      ulong                reward_slot,
+                      ulong                reward_epoch,
+                      fd_bls_set_t const * reward_set ) {
+  if( FD_UNLIKELY( !ctx->wait_info ) ) return; /* not in this topology */
+
+  ulong fork_id    = bank->vote_stakes_fork_id;
+  ulong fork_epoch = fd_vote_stakes_fork_epoch( fork_id );
+
+  /* Roll on the fork's epoch, not the cert's: the cert trails the bank
+     by FD_NUM_SLOTS_FOR_REWARD slots, so it still names the old epoch
+     over the first slots of a new one. */
+  ag_delinquent_epoch_roll( ctx, ctx->ag_last_settled, fork_epoch );
+
+  /* Only T-2 exposes stake and is_valid. */
+  if( FD_UNLIKELY( reward_epoch!=fork_epoch ) ) return;
+
+  /* Ranks are epoch-scoped, and forks can complete an epoch-E block
+     after an epoch-E+1 one. */
+  if( FD_UNLIKELY( ctx->ag_last_voted_epoch!=ULONG_MAX &&
+                   reward_epoch<ctx->ag_last_voted_epoch ) ) return;
+
+  /* Raise the watermark, so stamps age out as certs settle. */
+  ag_delinquent_epoch_roll( ctx, reward_slot, reward_epoch );
+
+  /* An empty cert is absence of evidence, so it stamps nothing.  With no
+     figure yet there is nothing to age either, but once one is known the
+     walk below must still run: the roll above advanced ag_last_settled,
+     so existing stamps age out even while certs are absent. */
+  if( FD_UNLIKELY( fd_bls_set_is_null( reward_set ) && !ctx->delinquent_known ) ) return;
+
+  /* Stamp straight off the cert: O(signers), no vote stakes walk.
+     Ranks the walk below skips are never read back. */
+  for( ulong rank=fd_bls_set_const_iter_init( reward_set );
+       !fd_bls_set_const_iter_done( rank );
+       rank=fd_bls_set_const_iter_next( reward_set, rank ) ) {
+    if( FD_UNLIKELY( rank>=AG_VAT_MAX ) ) break; /* FD_BLS_SET_MAX is sized separately */
+    ctx->ag_last_voted[ rank ] = fd_ulong_max( ctx->ag_last_voted[ rank ], reward_slot );
+  }
+
+  if( FD_LIKELY( ctx->delinquent_known &&
+                 reward_slot<ctx->delinquent_sample_slot+DELINQUENT_SAMPLE_SLOTS ) ) return;
+  ctx->delinquent_sample_slot = reward_slot;
+
+  fd_vote_stakes_t const * vote_stakes = fd_bank_vote_stakes( bank );
+  ulong                    delinquent  = 0UL;
+  ulong                    total       = 0UL;
+
+  uchar __attribute__((aligned(FD_VOTE_STAKES_ITER_ALIGN))) iter_mem[ FD_VOTE_STAKES_ITER_FOOTPRINT ];
+  for( fd_vote_stakes_iter_t * iter = fd_vote_stakes_iter_init( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter_mem );
+       !fd_vote_stakes_iter_done( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter );
+       fd_vote_stakes_iter_next( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter ) ) {
+    fd_pubkey_t pubkey;
+    ulong       stake    = 0UL;
+    uchar       is_valid = 0;
+    ushort      rank     = FD_VOTE_STAKES_ALPENGLOW_RANK_NULL;
+    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter,
+                             &pubkey, NULL, &stake, NULL, NULL, NULL, &is_valid, &rank, NULL, NULL );
+    if( FD_UNLIKELY( !is_valid || rank==FD_VOTE_STAKES_ALPENGLOW_RANK_NULL ) ) continue;
+    FD_TEST( rank<AG_VAT_MAX );
+
+    total += stake;
+    if( FD_UNLIKELY( !ag_rank_is_current( ctx->ag_last_settled, ctx->ag_last_voted[ rank ] ) ) ) {
+      delinquent += stake;
+    }
+  }
+
+  ctx->delinquent_stake_lamports     = delinquent;
+  ctx->cluster_active_stake_lamports = total;
+
+  /* Signers are stamped above before being tested, so they read
+     current on this very sample; only ranks absent from the cert read
+     delinquent.  The figure is therefore a mild over-estimate that
+     decays as later certs widen the union (safe). */
+  ctx->delinquent_known = 1;
+}
+
 static int
 replay_reward_cert_voted( fd_replay_tile_t * ctx,
                           fd_bank_t *        bank,
@@ -319,6 +520,8 @@ replay_reward_cert_voted( fd_replay_tile_t * ctx,
   if( FD_UNLIKELY( footer->has_skip_reward_cert ) ) fd_bls_set_union( reward_set, reward_set, footer->skip_reward_cert.signer_set  );
   if( FD_LIKELY( footer->has_notar_reward_cert ) ) fd_bls_set_union( reward_set, reward_set, footer->notar_reward_cert.signer_set );
   *count_out = (ushort)fd_bls_set_cnt( reward_set );
+
+  ag_update_delinquent( ctx, bank, reward_slot, reward_epoch, reward_set );
 
   if( FD_UNLIKELY( rank==USHORT_MAX ) ) return 0;
 
@@ -868,7 +1071,15 @@ publish_slot_completed( fd_replay_tile_t *        ctx,
 
   ulong slot = bank->f.slot;
 
-  if( FD_UNLIKELY( ctx->alpenglow ) ) ctx->reset_slot = fd_ulong_max( ctx->reset_slot, slot );
+  if( FD_UNLIKELY( ctx->alpenglow && slot>=ctx->reset_slot ) ) {
+    ctx->reset_slot = slot;
+
+    /* Under Alpenglow the votor does not send SLOT_DONE, so refresh
+       epoch info here.  Do not touch next_leader_slot: try_fini_leader
+       uses ULONG_MAX to continue the leader window. */
+
+    refresh_epoch_info( ctx, bank, slot );
+  }
 
   if( FD_UNLIKELY( is_initial ) ) bank->block_completed_nanos = fd_clock_tile_now( ctx->clock );
 
@@ -2201,6 +2412,9 @@ boot_genesis( fd_replay_tile_t *        ctx,
   ctx->reset_slot            = 0UL;
   ctx->reset_cmr             = ctx->initial_block_id;
   ctx->reset_dmr             = ctx->initial_block_id;
+  ctx->epoch_end_slot        = 0UL;
+  ctx->slots_per_epoch       = 0UL;
+  ctx->ns_per_slot           = 0UL;
   ctx->reset_timestamp_nanos = fd_clock_tile_now( ctx->clock );
   ctx->next_leader_slot      = fd_multi_epoch_leaders_get_next_slot( ctx->mleaders, 1UL, ctx->identity_pubkey );
   if( FD_LIKELY( ctx->next_leader_slot != ULONG_MAX ) ) {
@@ -2367,6 +2581,7 @@ on_snapshot_message( fd_replay_tile_t *  ctx,
     ctx->reset_slot            = snapshot_slot;
     ctx->reset_cmr             = manifest_block_id;
     ctx->reset_dmr             = manifest_block_id;
+    refresh_epoch_info( ctx, bank, snapshot_slot );
     ctx->reset_timestamp_nanos = fd_clock_tile_now( ctx->clock );
 
     fd_sched_block_add_done( ctx->sched, bank->idx, ULONG_MAX, snapshot_slot );
@@ -3901,15 +4116,12 @@ process_tower_slot_done( fd_replay_tile_t *           ctx,
 
   ctx->reset_cmr             = msg->reset_block_id;
   ctx->reset_slot            = msg->reset_slot;
+  refresh_epoch_info( ctx, bank, msg->reset_slot );
   ctx->reset_timestamp_nanos = fd_clock_tile_now( ctx->clock );
   if( FD_LIKELY( msg->root_slot!=ULONG_MAX ) ) FD_TEST( msg->root_slot<=msg->reset_slot );
 
   ulong min_leader_slot = fd_ulong_max( msg->reset_slot+1UL, fd_ulong_if( ctx->highwater_leader_slot==ULONG_MAX, 0UL, ctx->highwater_leader_slot+1UL ) );
-  if( FD_UNLIKELY( ctx->next_leader_query_start==ULONG_MAX || min_leader_slot<ctx->next_leader_query_start || min_leader_slot>ctx->next_leader_query_slot ) ) {
-    ctx->next_leader_query_start = min_leader_slot;
-    ctx->next_leader_query_slot  = fd_multi_epoch_leaders_get_next_slot( ctx->mleaders, min_leader_slot, ctx->identity_pubkey );
-  }
-  ctx->next_leader_slot = ctx->next_leader_query_slot;
+  ctx->next_leader_slot = query_next_leader_slot( ctx, min_leader_slot );
   if( FD_LIKELY( ctx->next_leader_slot != ULONG_MAX ) ) {
     double slot_duration_ticks = (double)bank->f.slot_params.ns_per_slot_adjusted*ctx->tick_per_ns;
     ctx->next_leader_tickcount = (long)((double)(ctx->next_leader_slot-ctx->reset_slot-1UL)*slot_duration_ticks) + fd_tickcount();
@@ -4336,6 +4548,58 @@ update_metric_active_stake( fd_bank_t const *   bank,
   FD_MGAUGE_SET( REPLAY, CLUSTER_ACTIVE_STAKE_LAMPORTS, tot_active_stake );
 }
 
+/* T-2 is required: last_vote_slot and is_valid are only available for
+   the T-2 vote-stake set (per-fork state in vacc_states).
+
+   This is a lightweight single-pass O(n) approximation.  The percentage
+   may differ slightly from the GUI's computation. */
+
+/* Returns 1 if the validator is current (not delinquent). */
+
+static inline int
+vote_account_is_current( ulong cur_slot, ulong last_vote_slot ) {
+  return last_vote_slot!=ULONG_MAX &&
+         (cur_slot<last_vote_slot || cur_slot-last_vote_slot<DELINQUENT_VALIDATOR_SLOT_DISTANCE);
+}
+
+static void
+update_delinquent_stake( fd_replay_tile_t * ctx,
+                         fd_bank_t const *  bank ) {
+  if( FD_UNLIKELY( !ctx->wait_info ) ) return; /* not in this topology */
+
+  fd_vote_stakes_t * vote_stakes = fd_bank_vote_stakes( bank );
+  ulong              fork_id     = bank->vote_stakes_fork_id;
+  ulong              cur_slot    = bank->f.slot;
+  ulong              delinquent  = 0UL;
+  ulong              total       = 0UL;
+
+  if( FD_LIKELY( ctx->delinquent_known &&
+                 cur_slot<ctx->delinquent_sample_slot+DELINQUENT_SAMPLE_SLOTS ) ) return;
+  ctx->delinquent_sample_slot = cur_slot;
+
+  uchar __attribute__((aligned(FD_VOTE_STAKES_ITER_ALIGN))) iter_mem[ FD_VOTE_STAKES_ITER_FOOTPRINT ];
+  for( fd_vote_stakes_iter_t * iter = fd_vote_stakes_iter_init( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter_mem );
+       !fd_vote_stakes_iter_done( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter );
+       fd_vote_stakes_iter_next( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter ) ) {
+    fd_pubkey_t pubkey;
+    ulong       stake          = 0UL;
+    ulong       last_vote_slot = 0UL;
+    uchar       is_valid       = 0;
+    fd_vote_stakes_iter_ele( vote_stakes, fork_id, FD_VOTE_STAKES_ITER_T_2, iter,
+                             &pubkey, NULL, &stake, &last_vote_slot,
+                             NULL, NULL, &is_valid, NULL, NULL, NULL );
+    if( FD_UNLIKELY( !is_valid ) ) continue;
+    total += stake;
+    if( FD_UNLIKELY( !vote_account_is_current( cur_slot, last_vote_slot ) ) ) {
+      delinquent += stake;
+    }
+  }
+
+  ctx->delinquent_stake_lamports     = delinquent;
+  ctx->cluster_active_stake_lamports = total;
+  ctx->delinquent_known              = 1;
+}
+
 static void
 update_metric_balances( fd_replay_tile_t * ctx,
                         fd_bank_t *        bank ) {
@@ -4349,6 +4613,10 @@ update_metric_balances( fd_replay_tile_t * ctx,
     update_metric_vote_account( ctx, bank, fork_id, &node_info->vote_account );
     update_metric_active_stake(      bank,          &node_info->vote_account );
   }
+
+  /* last_vote_slot only advances on a landed vote transaction, so this
+     is meaningless under Alpenglow. */
+  if( FD_LIKELY( !ctx->alpenglow ) ) update_delinquent_stake( ctx, bank );
 }
 
 static void
@@ -4463,6 +4731,14 @@ snapmk_done( fd_replay_tile_t *  ctx,
     ctx->snapmk.base_slot = bank->f.slot;
   }
 
+  if( FD_LIKELY( success ) ) {
+    if( FD_UNLIKELY( ctx->snapmk.incremental ) ) {
+      ctx->snapmk.snap_finished_incr = bank->f.slot;
+    } else {
+      ctx->snapmk.snap_finished_full = bank->f.slot;
+    }
+  }
+
   bank->refcnt--;
   ctx->snapmk.active = 0;
 }
@@ -4470,8 +4746,30 @@ snapmk_done( fd_replay_tile_t *  ctx,
 static void
 msg_snapmk( fd_replay_tile_t *  ctx,
             fd_stem_context_t * stem,
-            ulong               msg_type ) {
+            ulong               msg_type,
+            ulong               in_idx,
+            ulong               chunk ) {
   switch( msg_type ) {
+  case FD_SNAPMK_MSG_FOUND: {
+    fd_snapmk_msg_found_t const * found = fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk );
+    if( FD_UNLIKELY( found->base_slot==ULONG_MAX ) ) {
+      /* Full snapshot */
+      if( found->slot > ctx->snapmk.snap_finished_full ) ctx->snapmk.snap_finished_full = found->slot;
+    } else {
+      /* Incremental snapshot */
+      if( found->slot > ctx->snapmk.snap_finished_incr ) ctx->snapmk.snap_finished_incr = found->slot;
+    }
+    break;
+  }
+  case FD_SNAPMK_MSG_DELETED: {
+    fd_snapmk_msg_deleted_t const * deleted = fd_chunk_to_laddr( ctx->in[ in_idx ].mem, chunk );
+    if( FD_UNLIKELY( deleted->base_slot==ULONG_MAX ) ) {
+      if( deleted->slot==ctx->snapmk.snap_finished_full ) ctx->snapmk.snap_finished_full = 0UL;
+    } else {
+      if( deleted->slot==ctx->snapmk.snap_finished_incr ) ctx->snapmk.snap_finished_incr = 0UL;
+    }
+    break;
+  }
   case FD_SNAPMK_MSG_CREATED:
     snapmk_done( ctx, stem, 1 );
     break;
@@ -4798,7 +5096,7 @@ returnable_frag( fd_replay_tile_t *  ctx,
       break;
     }
     case IN_KIND_SNAPMK:
-      msg_snapmk( ctx, stem, sig );
+      msg_snapmk( ctx, stem, sig, in_idx, chunk );
       break;
     case IN_KIND_ADMIN:
       msg_admin( ctx, stem, fd_frag_meta_ctl_orig( ctl ), sig );
@@ -4972,8 +5270,20 @@ unprivileged_init( fd_topo_t const *      topo,
   if( FD_LIKELY( ctx->has_vote_account ) ) ctx->node_info->info.vote_account = *ctx->vote_account; /* Alpenglow only, we publish, not Tower */
   fd_node_info_write_end( ctx->node_info );
 
+  ulong wait_info_obj_id = fd_pod_query_ulong( topo->props, "wait_info", ULONG_MAX );
+  if( FD_LIKELY( wait_info_obj_id!=ULONG_MAX ) ) {
+    ctx->wait_info = fd_wait_info_box_join( fd_topo_obj_laddr( topo, wait_info_obj_id ) );
+    FD_TEST( ctx->wait_info );
+  } else {
+    ctx->wait_info = NULL;
+  }
+
   FD_MGAUGE_SET( REPLAY, BANK_LIVE_MAX, fd_banks_pool_max_cnt( ctx->banks ) );
 
+  ctx->delinquent_known       = 0;
+  ctx->delinquent_sample_slot = 0UL;
+  ctx->ag_last_voted_epoch = ULONG_MAX;
+  ctx->ag_last_settled     = 0UL;
   ctx->consensus_root_slot = ULONG_MAX;
   ctx->consensus_root      = ctx->initial_block_id;
   ctx->finalized_block_id_lo = ag_block_id( ULONG_MAX, ctx->initial_block_id.uc );
@@ -5116,6 +5426,8 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->snapmk.incremental_interval_blocks   = tile->replay.incremental_snapshot_interval_blocks;
   ctx->snapmk.next_incremental_block_height = ULONG_MAX;
   ctx->snapmk.base_slot                     = ULONG_MAX;
+  ctx->snapmk.snap_finished_full            = 0UL;
+  ctx->snapmk.snap_finished_incr            = 0UL;
   if( FD_UNLIKELY( !ctx->snapmk.supported ) ) {
     ctx->snapmk.full_interval_blocks        = 0UL;
     ctx->snapmk.incremental_interval_blocks = 0UL;
@@ -5123,6 +5435,9 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->reset_slot            = 0UL;
   ctx->reset_cmr             = ctx->initial_block_id;
   ctx->reset_dmr             = ctx->initial_block_id;
+  ctx->epoch_end_slot        = 0UL;
+  ctx->slots_per_epoch       = 0UL;
+  ctx->ns_per_slot           = 0UL;
   ctx->reset_timestamp_nanos = 0UL;
   ctx->next_leader_slot      = ULONG_MAX;
   ctx->next_leader_tickcount = LONG_MAX;

@@ -165,3 +165,43 @@ validators are found.
 | `--clean` | Remove entries for validators that are no longer running |
 
 <<< @/snippets/commands/ps.ansi
+
+## `wait`
+Waits for a safe window to stop a running validator. Attaches to the
+validator and polls every second until all of the following are true:
+
+ - The validator is caught up (replay tile `caught_up` flag)
+ - There are enough idle slots before the next leader slot
+ - No snapshot is currently being written. When periodic snapshot
+   production is enabled, a full snapshot exists on disk and, if
+   periodic incremental snapshots are configured, a fresh incremental
+   has been produced since the command started
+ - Cluster delinquent stake is below the threshold
+
+Once all checks pass the command prints `safe to stop` and exits
+successfully. The validator keeps running either way.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | A safe window was found |
+| `2` | The validator exited while waiting |
+| `128+sig` | Interrupted by a signal, as a shell reports it (`130` for `SIGINT`, `143` for `SIGTERM`) |
+| `1` | Any other failure |
+
+Like other discovery commands, `wait` finds the running validator
+automatically. If more than one validator is running, pass
+`--name <name>` to select one.
+
+The status panel redraws in place, so it is only drawn when stdout is
+a terminal. When stdout is redirected to a file or a pipe the command
+prints nothing while it polls; the log records the outcome, and an
+exit that never found a safe window reports the state of each check.
+
+| Arguments                          | Description |
+|------------------------------------|-------------|
+| `--min-idle-slots <slots>`         | Minimum number of idle slots required before the next leader slot. Default: 1500 |
+| `--min-idle-seconds <seconds>`     | Minimum idle time in seconds before the next leader slot. Converted to slots using the live slot duration. Mutually exclusive with `--min-idle-slots` |
+| `--max-delinquent-stake <percent>` | Maximum percentage of delinquent stake allowed, in range [0–100]. Default: 5. Set to 100 to disable the check |
+| `--skip-health-check`              | Skip the health check (replay caught-up status) |
+| `--skip-snapshot-check`            | Skip the snapshot check |
+| `--name <name>`                    | Select a specific validator by name when multiple are running on the same host |
