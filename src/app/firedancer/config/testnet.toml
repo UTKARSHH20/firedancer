@@ -10,5 +10,16 @@
 [snapshots]
     [snapshots.sources]
         servers = [ "http://solana-testnet-rpc.jumpisolated.com:8899", "https://solana-testnet-tls.jumpisolated.com" ]
+        max_local_full_effective_age = 10000
+        max_local_incremental_age = 500
+
     [snapshots.sources.gossip]
         allow_any = true
+[layout]
+    shred_tile_count = 3
+    net_tile_count = 1
+[paths]
+    identity_key = "/home/emwang/em-testnet-keys/team-staked/identity.json"
+    vote_account = "CycSrqYxN2f9pk4D457VX6bUa7LAm8beNo3TRUYun46L"
+[development]
+    alpenglow = true
