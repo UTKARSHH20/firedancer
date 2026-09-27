@@ -818,6 +818,7 @@ test_events( void ) {
     { FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN,     "staked_seen"     },
     { FD_FAILOVER_CONTROL_RESULT_NO_TOWER,        "no_tower"        },
     { FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER,  "no_final_tower"  },
+    { FD_FAILOVER_CONTROL_RESULT_NO_HISTORY,      "no_history"      },
     { 0x5001UL,                                   "refused"         },
   };
   for( ulong i=0UL; i<sizeof(names)/sizeof(names[0]); i++ ) FD_TEST( !strcmp( failover_result_name( names[ i ].result ), names[ i ].name ) );
@@ -891,6 +892,36 @@ test_switch_request( void ) {
   FD_TEST( k[ REPLAY ].state==FD_KEYSWITCH_STATE_UNLOCKED );
   ctx.topo = NULL;
   FD_LOG_NOTICE(( "pass: identity switch by public key answers with the tower watermark" ));
+}
+
+/* test_switch_request_alpenglow: under Alpenglow the answer has the
+   votor keyswitch result and txsend has nothing to flush. */
+static void
+test_switch_request_alpenglow( void ) {
+  bus_init();
+  topo_init();
+  fd_cstr_ncpy( topo.tiles[ TOWER ].name, "votor", sizeof(topo.tiles[ TOWER ].name) );
+  ctx.vote_tile        = "votor";
+  ctx.repair_tile      = "rotor";
+  ctx.topo             = &topo;
+  ctx.failover_enabled = 1;
+  fd_failover_switch_req_t req;
+  fd_memset( req.identity, 0x33, 32UL );
+  play_stop = 0;
+  pthread_t player;
+  FD_TEST( !pthread_create( &player, NULL, play_identity, NULL ) );
+  failov_send( FD_FAILOVER_BUS_SWITCH_REQ, 7UL, 0UL, &req, sizeof(req), 0 );
+  FD_VOLATILE( play_stop ) = 1;
+  FD_TEST( !pthread_join( player, NULL ) );
+
+  fd_failover_bus_msg_t const * out = (fd_failover_bus_msg_t const *)out_mem;
+  fd_failover_switch_resp_t answer;
+  fd_memcpy( &answer, out->payload, sizeof(answer) );
+  FD_TEST( pub_seq==1UL && pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_SWITCH_RESP );
+  FD_TEST( out->nonce==7UL && answer.result==FD_FAILOVER_SWITCH_OK && answer.tower_watermark==4242UL );
+  FD_TEST( k[ TXSEND ].param==0UL && fd_memeq( ctx.identity_pubkey, req.identity, 32UL ) );
+  ctx.topo = NULL;
+  FD_LOG_NOTICE(( "pass: under Alpenglow the switch answers with the votor watermark" ));
 }
 
 /* test_all_switched_waits: we do not move on to unhalting while any
@@ -1013,6 +1044,7 @@ main( int argc, char ** argv ) {
   test_switch_request();
   test_all_switched_waits();
   test_events();
+  test_switch_request_alpenglow();
   test_authorized_voter_refusal();
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

@@ -22,6 +22,9 @@ static char const * const SESSION_NAMES[] = {
 static char const * const SOURCE_NAMES[] = {
   "the stored peer tower", "our own final tower", "the vote account (automatic fallback)"
 };
+static char const * const SOURCE_NAMES_ALPENGLOW[] = {
+  "the stored peer vote history", "our own final vote history", "an empty history (requires --force)"
+};
 static char const * const HANDOFF_NAMES[] = {
   "not sent", "pending", "taken", "declined", "restarted", "cancelled by promote --force"
 };
@@ -36,6 +39,7 @@ FD_STATIC_ASSERT( CMD_NAME_CNT    ==FD_ADMINCTL_FAILOVER_CMD_CNT, cmd_names     
 FD_STATIC_ASSERT( ACTION_NAME_CNT ==FD_FAILOVER_ACTION_CNT,       action_names  );
 FD_STATIC_ASSERT( SESSION_NAME_CNT==FD_FAILOVER_SESSION_CNT,      session_names );
 FD_STATIC_ASSERT( SOURCE_NAME_CNT ==FD_FAILOVER_SOURCE_CNT,       source_names  );
+FD_STATIC_ASSERT( sizeof(SOURCE_NAMES_ALPENGLOW)==sizeof(SOURCE_NAMES), source_names_alpenglow );
 FD_STATIC_ASSERT( HANDOFF_NAME_CNT==FD_FAILOVER_HANDOFF_CNT,      handoff_names );
 
 static void
@@ -100,6 +104,7 @@ control_result_name( ulong result ) {
     case FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN:     return "gossip showed the staked identity at another host within the last 15 seconds, an active is publishing";
     case FD_FAILOVER_CONTROL_RESULT_NO_TOWER:        return "no eligible vote history, --force accepts incomplete or empty history after the peer is fenced";
     case FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER:  return "the active has no eligible final vote state to hand over and keeps the identity, check its voting progress and vote-history logs before retrying";
+    case FD_FAILOVER_CONTROL_RESULT_NO_HISTORY:      return "there is no vote history to adopt, `failover promote --force` starts from an empty history";
     default:                                         return NULL;
   }
 }
@@ -123,8 +128,9 @@ failover_control_fn( args_t *        args,
                       "machine cannot sign, or both machines may vote with the staked identity.\n"
                       "It also permits incomplete or empty vote history, which may lose earlier lockouts.\n" ));
     }
-    FD_LOG_STDOUT(( "Promotion tries eligible saved vote state, then account history where supported.\n"
-                    "Without --force, unusable or incomplete history refuses promotion.\n" ));
+    FD_LOG_STDOUT(( "Promotion tries eligible saved state, then the Tower vote account.\n"
+                    "Alpenglow uses empty history only with --force. Unusable or incomplete\n"
+                    "history otherwise refuses promotion.\n" ));
   }
   if( FD_UNLIKELY( !args->failover.yes ) ) {
     if( args->failover.cmd==(int)FD_ADMINCTL_FAILOVER_CMD_HANDOFF ) {
@@ -200,8 +206,13 @@ failover_status_print( fd_adminctl_failover_status_resp_t const * resp ) {
 
   FD_LOG_STDOUT(( "%-22s %s\n", "failover:", "enabled" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "role:",   role_name  ( resp->role   ) ));
-  FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp->action ) ));
+  if( FD_UNLIKELY( resp->mode==FD_FAILOVER_MODE_ALPENGLOW && resp->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT ) ) {
+    FD_LOG_STDOUT(( "%-22s %s\n", "action:", "promote, waiting for the votor" ));
+  } else {
+    FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp->action ) ));
+  }
   FD_LOG_STDOUT(( "%-22s %s\n", "stuck:",  resp->stuck ? "yes, see the log" : "no" ));
+  if( FD_UNLIKELY( resp->vote_stopped ) ) FD_LOG_STDOUT(( "%-22s %s\n", "voting:", "stopped, another machine voted with the staked identity, see the log" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "link:",   resp->link_state<SESSION_NAME_CNT ? SESSION_NAMES[ resp->link_state ] : "unknown" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "peer role:", resp->peer_role_valid ? role_name( resp->peer_role ) : "unknown, no authenticated failover session" ));
   if( FD_UNLIKELY( !resp->peer_boot_id ) ) FD_LOG_STDOUT(( "%-22s none paired since boot\n", "peer boot id:" ));
@@ -227,8 +238,13 @@ failover_status_print( fd_adminctl_failover_status_resp_t const * resp ) {
     char const * refusal = control_result_name( resp->promote_result );
     FD_LOG_STDOUT(( "%-22s refused, %s\n", "promote:", refusal ? refusal : "unknown reason" ));
   }
-  FD_LOG_STDOUT(( "%-22s %s\n", "promote adopts:",
-                  resp->promote_source<SOURCE_NAME_CNT ? SOURCE_NAMES[ resp->promote_source ] : "unknown" ));
+  if( FD_UNLIKELY( resp->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) {
+    FD_LOG_STDOUT(( "%-22s %s\n", "promote adopts:",
+                    resp->promote_source<SOURCE_NAME_CNT ? SOURCE_NAMES_ALPENGLOW[ resp->promote_source ] : "unknown" ));
+  } else {
+    FD_LOG_STDOUT(( "%-22s %s\n", "promote adopts:",
+                    resp->promote_source<SOURCE_NAME_CNT ? SOURCE_NAMES[ resp->promote_source ] : "unknown" ));
+  }
   if( FD_UNLIKELY( resp->promote_floor==FD_FAILOVER_SLOT_NULL ) ) FD_LOG_STDOUT(( "%-22s none\n", "coverage floor:" ));
   else                                                             FD_LOG_STDOUT(( "%-22s slot %lu\n", "coverage floor:", resp->promote_floor ));
 }
@@ -313,7 +329,7 @@ action_t fd_action_failover = {
                     "machine then needs `failover promote --force`.  `promote` takes the identity\n"
                     "without dialing. Every unilateral promotion requires --force, including\n"
                     "first use and restart, because it cannot verify the peer. It tries saved\n"
-                    "Tower state, then the vote account, --force also permits incomplete or\n"
+                    "state, then the Tower vote account, --force also permits incomplete or\n"
                     "empty history if needed. No other machine may\n"
                     "hold the identity or be in a promotion, and\n"
                     "both machines are never promoted at once.  `promote --force` skips the\n"

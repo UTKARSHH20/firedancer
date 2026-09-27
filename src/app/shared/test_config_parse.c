@@ -178,8 +178,8 @@ main( int     argc,
   FD_TEST(  genesis_max_file_size_is_valid( config, 4055UL ) );
   FD_TEST( !genesis_max_file_size_is_valid( config, 4056UL ) );
 
-  /* Failover needs a nonzero port, no Alpenglow, a junk key apart
-     from the staked identity key and a peer address without a port. */
+  /* Failover needs a nonzero port, a junk key apart from the staked
+     identity key and a peer address without a port. */
 
   static char const identity[] = "/keys/identity.json";
   static char const junk[]     = "/keys/junk.json";
@@ -187,7 +187,7 @@ main( int     argc,
   FD_TEST(  failover_is_valid( config, "",       8010, 0, ""                 ) );
   FD_TEST(  failover_is_valid( config, junk,     8010, 0, ""                 ) );
   FD_TEST( !failover_is_valid( config, junk,     0,    0, ""                 ) );
-  FD_TEST( !failover_is_valid( config, junk,     8010, 1, ""                 ) );
+  FD_TEST(  failover_is_valid( config, junk,     8010, 1, ""                 ) );
   FD_TEST( !failover_is_valid( config, identity, 8010, 0, ""                 ) );
   FD_TEST(  failover_is_valid( config, junk,     8010, 0, "10.0.0.2"         ) );
   FD_TEST(  failover_is_valid( config, junk,     8010, 0, "peer.example.com" ) );
