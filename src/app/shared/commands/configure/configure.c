@@ -222,6 +222,7 @@ check_file( const char * path,
 
 static char const *
 configure_stage_help( char const * name ) {
+  if( !strcmp( name, "kernel-modules"   ) ) return "load required kernel modules";
   if( !strcmp( name, "hugetlbfs"        ) ) return "mount the huge page filesystems";
   if( !strcmp( name, "sysctl"           ) ) return "apply required kernel sysctl tunables";
   if( !strcmp( name, "hyperthreads"     ) ) return "check sibling hyperthreads are not in use";
