@@ -509,6 +509,12 @@ sync_session( fd_failover_tile_ctx_t * ctx ) {
     if( FD_UNLIKELY( ( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY ||
                        ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT ) &&
                      peer->role==(uchar)FD_FAILOVER_ROLE_ACTIVE ) ) ctx->promote_active_seen = 1;
+    /* An active peer votes past any tower we kept, a promotion in flight
+       already copied the one it adopts. */
+    if( FD_UNLIKELY( peer->role==(uchar)FD_FAILOVER_ROLE_ACTIVE ) ) {
+      ctx->peer_tower.valid = 0;
+      ctx->own_tower.valid  = 0;
+    }
   }
 }
 
@@ -1710,6 +1716,9 @@ handle_control( fd_failover_tile_ctx_t * ctx,
     ctx->taken         = 1;
     ctx->taken_boot_id = ctx->handoff_target;
     ctx->stuck         = 0;
+    /* The peer votes past the final tower we handed it from here on. */
+    ctx->peer_tower.valid = 0;
+    ctx->own_tower.valid  = 0;
     handoff_result( ctx, ack.handoff_id, FD_ADMINCTL_RESULT_SUCCESS );
     return;
   }
