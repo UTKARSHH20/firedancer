@@ -22,6 +22,9 @@ static char const * const SESSION_NAMES[] = {
 static char const * const SOURCE_NAMES[] = {
   "the stored peer tower", "our own final tower", "the vote account, needs --yes"
 };
+static char const * const SOURCE_NAMES_ALPENGLOW[] = {
+  "the stored peer vote history", "our own final vote history", "an empty history, needs --yes"
+};
 static char const * const HANDOFF_NAMES[] = {
   "not sent", "pending", "taken", "declined", "restarted", "cancelled by promote --force"
 };
@@ -36,6 +39,7 @@ FD_STATIC_ASSERT( CMD_NAME_CNT    ==FD_ADMINCTL_FAILOVER_CMD_CNT, cmd_names     
 FD_STATIC_ASSERT( ACTION_NAME_CNT ==FD_FAILOVER_ACTION_CNT,       action_names  );
 FD_STATIC_ASSERT( SESSION_NAME_CNT==FD_FAILOVER_SESSION_CNT,      session_names );
 FD_STATIC_ASSERT( SOURCE_NAME_CNT ==FD_FAILOVER_SOURCE_CNT,       source_names  );
+FD_STATIC_ASSERT( sizeof(SOURCE_NAMES_ALPENGLOW)==sizeof(SOURCE_NAMES), source_names_alpenglow );
 FD_STATIC_ASSERT( HANDOFF_NAME_CNT==FD_FAILOVER_HANDOFF_CNT,      handoff_names );
 
 static void
@@ -99,6 +103,7 @@ control_result_name( ulong result ) {
     case FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN:     return "gossip showed the staked identity at another host within the last 15 seconds, an active is publishing";
     case FD_FAILOVER_CONTROL_RESULT_NO_TOWER:        return "there is no tower to adopt, `failover promote --yes` adopts the vote account";
     case FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER:  return "the tower of our last vote is not known yet, this machine keeps the identity, retry after its next vote";
+    case FD_FAILOVER_CONTROL_RESULT_NO_HISTORY:      return "there is no vote history to adopt, `failover promote --yes` starts from an empty history";
     default:                                         return NULL;
   }
 }
@@ -192,8 +197,13 @@ failover_status_print( fd_adminctl_failover_status_resp_t const * resp ) {
 
   FD_LOG_STDOUT(( "%-22s %s\n", "failover:", "enabled" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "role:",   role_name  ( resp->role   ) ));
-  FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp->action ) ));
+  if( FD_UNLIKELY( resp->mode==FD_FAILOVER_MODE_ALPENGLOW && resp->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT ) ) {
+    FD_LOG_STDOUT(( "%-22s %s\n", "action:", "promote, waiting for the votor" ));
+  } else {
+    FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp->action ) ));
+  }
   FD_LOG_STDOUT(( "%-22s %s\n", "stuck:",  resp->stuck ? "yes, see the log" : "no" ));
+  if( FD_UNLIKELY( resp->vote_stopped ) ) FD_LOG_STDOUT(( "%-22s %s\n", "voting:", "stopped, another machine voted with the staked identity, see the log" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "link:",   resp->link_state<SESSION_NAME_CNT ? SESSION_NAMES[ resp->link_state ] : "unknown" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "peer role:", resp->peer_role_valid ? role_name( resp->peer_role ) : "unknown" ));
   if( FD_UNLIKELY( !resp->peer_boot_id ) ) FD_LOG_STDOUT(( "%-22s none paired since boot\n", "peer boot id:" ));
@@ -219,8 +229,13 @@ failover_status_print( fd_adminctl_failover_status_resp_t const * resp ) {
     char const * refusal = control_result_name( resp->promote_result );
     FD_LOG_STDOUT(( "%-22s refused, %s\n", "promote:", refusal ? refusal : "unknown reason" ));
   }
-  FD_LOG_STDOUT(( "%-22s %s\n", "promote adopts:",
-                  resp->promote_source<SOURCE_NAME_CNT ? SOURCE_NAMES[ resp->promote_source ] : "unknown" ));
+  if( FD_UNLIKELY( resp->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) {
+    FD_LOG_STDOUT(( "%-22s %s\n", "promote adopts:",
+                    resp->promote_source<SOURCE_NAME_CNT ? SOURCE_NAMES_ALPENGLOW[ resp->promote_source ] : "unknown" ));
+  } else {
+    FD_LOG_STDOUT(( "%-22s %s\n", "promote adopts:",
+                    resp->promote_source<SOURCE_NAME_CNT ? SOURCE_NAMES[ resp->promote_source ] : "unknown" ));
+  }
   if( FD_UNLIKELY( resp->promote_floor==FD_FAILOVER_SLOT_NULL ) ) FD_LOG_STDOUT(( "%-22s none\n", "coverage floor:" ));
   else                                                             FD_LOG_STDOUT(( "%-22s slot %lu\n", "coverage floor:", resp->promote_floor ));
 }

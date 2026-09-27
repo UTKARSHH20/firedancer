@@ -431,6 +431,10 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_wksp( topo, "admin_failov" );
     fd_topob_wksp( topo, "failov_admin" );
     if( !alpenglow_enabled ) fd_topob_wksp( topo, "failov_tower" );
+    else {
+      fd_topob_wksp( topo, "failov_votor" );
+      fd_topob_wksp( topo, "votor_hist"   );
+    }
   }
 
   if( FD_LIKELY( snapshots_enabled ) ) {
@@ -528,6 +532,10 @@ fd_topo_initialize( config_t * config ) {
     if( !alpenglow_enabled ) {
     /**/               fd_topob_link( topo, "failov_tower",  "failov_tower",  32UL,                                     FD_FAILOVER_TOWER_STATE_MAX,   1UL );
     /**/               fd_topob_link( topo, "tower_failov",  "failov_tower",  32UL,                                     sizeof(fd_tower_adopt_result_t), 1UL );
+    } else {
+    /**/               fd_topob_link( topo, "failov_votor",  "failov_votor",  32UL,                                     FD_FAILOVER_STATE_MAX,           1UL );
+    /**/               fd_topob_link( topo, "votor_failov",  "failov_votor",  32UL,                                     sizeof(fd_votor_adopt_result_t), 1UL );
+    /**/               fd_topob_link( topo, "votor_hist",    "votor_hist",    1024UL,                                   sizeof(fd_votor_hist_msg_t),     1UL );
     }
   }
   if( leader_enabled ) {
@@ -800,6 +808,14 @@ fd_topo_initialize( config_t * config ) {
        stay the tower tile's first output link. */
     /**/               fd_topob_tile_out(   topo, "failov",  0UL,                       "failov_tower",  0UL                                                );
     /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "tower_failov",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+  }
+  if( alpenglow_enabled && failover_enabled ) {
+    /* The votor stands in for the tower here, its history frames are
+       read like tower_out and the votor side is wired with the other
+       Alpenglow links below. */
+    /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "votor_hist",    0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    /**/               fd_topob_tile_out(   topo, "failov",  0UL,                       "failov_votor",  0UL                                                );
+    /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "votor_failov",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   }
 
   FOR(execrp_tile_cnt) fd_topob_tile_in (   topo, "execrp",  i,            "metric_in", "replay_execrp", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
@@ -1203,6 +1219,11 @@ fd_topo_initialize( config_t * config ) {
     /**/               fd_topob_tile_out(   topo, "votor",  0UL,                       "votor_sign",    0UL                                                  );
     /**/               fd_topob_tile_in (   topo, "votor",  0UL,          "metric_in", "sign_votor",    0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
     /**/               fd_topob_tile_out(   topo, "sign",   0UL,                       "sign_votor",    0UL                                                  );
+    if( FD_UNLIKELY( failover_enabled ) ) {
+      /**/             fd_topob_tile_in (   topo, "votor",  0UL,          "metric_in", "failov_votor",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED   );
+      /**/             fd_topob_tile_out(   topo, "votor",  0UL,                       "votor_hist",    0UL                                                  );
+      /**/             fd_topob_tile_out(   topo, "votor",  0UL,                       "votor_failov",  0UL                                                  );
+    }
   }
 
   /* Grant the admin tile access to every keyswitch object in the
