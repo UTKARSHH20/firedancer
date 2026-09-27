@@ -1352,6 +1352,7 @@ failover_result_name( ulong result ) {
     case FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN:     return "staked_seen";
     case FD_FAILOVER_CONTROL_RESULT_NO_TOWER:        return "no_tower";
     case FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER:  return "no_final_tower";
+    case FD_FAILOVER_CONTROL_RESULT_NO_HISTORY:      return "no_history";
     default:                                         return "refused";
   }
 }
@@ -1621,11 +1622,12 @@ failover_switch_request( fd_admin_tile_ctx_t * ctx,
 
     /* The watermark is the tower's output sequence at its halt, which
        the tower tile leaves in its keyswitch result.  halted_seq is
-       replay's. */
+       replay's.  Under Alpenglow the votor leaves its votor_hist
+       sequence there. */
     answer.result          = FD_FAILOVER_SWITCH_OK;
-    answer.tower_watermark = find_identity_keyswitch( ctx, "tower" )->result;
+    answer.tower_watermark = find_identity_keyswitch( ctx, ctx->vote_tile )->result;
     report_admin_command( &event, FD_EVENT_ADMIN_COMMAND_RESULT_SUCCESS );
-    FD_LOG_NOTICE(( "failover: every tile switched to `%s`, the tower halted signing at sequence %lu", new_identity, answer.tower_watermark ));
+    FD_LOG_NOTICE(( "failover: every tile switched to `%s`, the %s halted signing at sequence %lu", new_identity, ctx->vote_tile, answer.tower_watermark ));
   } else {
     FD_LOG_WARNING(( "the failover tile asked for an identity switch but failover is off, refusing" ));
   }

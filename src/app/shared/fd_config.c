@@ -580,9 +580,6 @@ fd_config_validate_failover( fd_config_t const * config ) {
   if( FD_UNLIKELY( !f->failover.port ) ) {
     FD_LOG_ERR(( "[failover.port] must not be zero" ));
   }
-  if( FD_UNLIKELY( f->development.alpenglow ) ) {
-    FD_LOG_ERR(( "failover does not support [development.alpenglow], unset [failover.junk_identity_key]" ));
-  }
   if( FD_UNLIKELY( !strcmp( f->failover.junk_identity_key, config->paths.identity_key ) ) ) {
     FD_LOG_ERR(( "[failover.junk_identity_key] must differ from [paths.identity_key], which is the staked identity under failover" ));
   }

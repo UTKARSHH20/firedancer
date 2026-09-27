@@ -78,6 +78,7 @@
 #define FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER           (0x400CUL) /* active has no eligible final vote state; see its local voting diagnostics */
 #define FD_FAILOVER_CONTROL_RESULT_NO_ACTIVE_ADDRESS        (0x400EUL) /* gossip has no address for the active */
 #define FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED          (0x400FUL) /* unilateral promote cannot verify the peer; explicit fencing required */
+#define FD_FAILOVER_CONTROL_RESULT_NO_HISTORY               (0x400DUL) /* alpenglow, no vote history to adopt, promote --force permits empty history */
 
 struct fd_adminctl_add_auth_voter_v1 {
   ulong version; /* ==FD_ADMINCTL_ADD_AUTH_VOTER_PAYLOAD_VERSION */
@@ -201,12 +202,15 @@ struct fd_adminctl_failover_status_resp_v1 {
   ulong  handoff_id;      /* id of our last handoff, 0 none */
   ulong  promote_floor;   /* coverage floor a promote has to reach, ULONG_MAX none */
   ulong  promote_result;  /* FD_ADMINCTL_RESULT_SUCCESS, or the refusal a promote would get now */
+  uchar  mode;            /* FD_FAILOVER_MODE_* the validator runs */
+  uchar  vote_stopped;    /* alpenglow, the votor stopped voting on a vote from our identity it never cast */
+  uchar  reserved[ 6 ];
 };
 typedef struct fd_adminctl_failover_status_resp_v1 fd_adminctl_failover_status_resp_t;
 #define FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION (1UL)
 
 FD_STATIC_ASSERT( sizeof(fd_adminctl_failover_status_req_t )==8UL,  failover_status_req_v1_layout  );
-FD_STATIC_ASSERT( sizeof(fd_adminctl_failover_status_resp_t)==56UL, failover_status_resp_v1_layout );
+FD_STATIC_ASSERT( sizeof(fd_adminctl_failover_status_resp_t)==64UL, failover_status_resp_v1_layout );
 FD_STATIC_ASSERT( sizeof(fd_adminctl_failover_status_resp_t)<=FD_ADMINCTL_PAYLOAD_MAX, failover_status_resp_fits );
 
 /* fd_adminctl_failover_status_resp_init stamps the version and every

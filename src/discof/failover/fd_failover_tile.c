@@ -11,6 +11,7 @@
 #include "../../util/fd_version.h"
 #include "../../util/net/fd_ip4.h"
 #include "../tower/fd_tower_tile.h"
+#include "../votor/fd_votor_tile.h"
 
 #include "fd_failover_bus.h"
 #include "fd_failover_channel.h"
@@ -20,6 +21,21 @@
 #include <sys/socket.h>
 
 #include "generated/fd_failover_tile_seccomp.h"
+
+/* The votor answers adoptions in the tower tile's layout, with its
+   vote_bound where the tower tile has acct_vote_slot, which alpenglow
+   never reads.  Its codes match the tower tile's up to BLOCK_MISMATCH,
+   see votor_adopt_code. */
+FD_STATIC_ASSERT( FD_VOTOR_ADOPT_SUCCESS            ==FD_TOWER_ADOPT_SUCCESS,             adopt_codes );
+FD_STATIC_ASSERT( FD_VOTOR_ADOPT_ERR_DECODE         ==FD_TOWER_ADOPT_ERR_DECODE,          adopt_codes );
+FD_STATIC_ASSERT( FD_VOTOR_ADOPT_ERR_INVALID        ==FD_TOWER_ADOPT_ERR_INVALID,         adopt_codes );
+FD_STATIC_ASSERT( FD_VOTOR_ADOPT_ERR_UNREPLAYED_ROOT==FD_TOWER_ADOPT_ERR_UNREPLAYED_ROOT, adopt_codes );
+FD_STATIC_ASSERT( FD_VOTOR_ADOPT_ERR_BLOCK_MISMATCH ==FD_TOWER_ADOPT_ERR_BLOCK_MISMATCH,  adopt_codes );
+FD_STATIC_ASSERT( sizeof(fd_votor_adopt_result_t)==sizeof(fd_tower_adopt_result_t), adopt_layout );
+FD_STATIC_ASSERT( offsetof(fd_votor_adopt_result_t,result)    ==offsetof(fd_tower_adopt_result_t,result),         adopt_layout );
+FD_STATIC_ASSERT( offsetof(fd_votor_adopt_result_t,root)      ==offsetof(fd_tower_adopt_result_t,root),           adopt_layout );
+FD_STATIC_ASSERT( offsetof(fd_votor_adopt_result_t,vote_slot) ==offsetof(fd_tower_adopt_result_t,vote_slot),      adopt_layout );
+FD_STATIC_ASSERT( offsetof(fd_votor_adopt_result_t,vote_bound)==offsetof(fd_tower_adopt_result_t,acct_vote_slot), adopt_layout );
 
 /* The failov tile owns the socket to the other failover machine and is
    the only tile that keeps host networking for it.  It holds this
@@ -55,12 +71,13 @@
 #define FD_FAILOVER_SWITCH_KEY_STAKED (1UL)
 #define FD_FAILOVER_SWITCH_KEY_CNT    (2UL)
 
-/* A compact tower and the slot of its last vote. */
+/* A compact tower and the slot of its last vote.  In alpenglow mode it
+   is a vote history and its tip. */
 struct fd_failover_tower {
   int   valid;
   ulong tip;
   ulong sz;
-  uchar state[ FD_FAILOVER_TOWER_STATE_MAX ];
+  uchar state[ FD_FAILOVER_STATE_MAX ];
 };
 
 typedef struct fd_failover_tower fd_failover_tower_t;
@@ -232,6 +249,16 @@ struct fd_failover_tile_ctx {
   ulong                tower_seen_seq; /* seq of the last tower_out frag taken in, ULONG_MAX before any */
   int                  tower_gap;      /* a tower_out frag was skipped since the cached tower was built */
 
+  /* Under Alpenglow the vote tile is votor, its frames come on
+     votor_hist in place of tower_out and the adopt links are
+     failov_votor and votor_failov.  The frame is the full history. */
+  ulong               mode;             /* FD_FAILOVER_MODE_* */
+  fd_votor_hist_msg_t hist;
+  ulong               adopt_anchor;     /* finality anchor of the history being adopted, SLOT_NULL when none */
+  ulong               empty_vote_after; /* an empty history votes only past this slot, SLOT_NULL until known */
+  int                 vote_stopped;     /* the votor's latest frame says a doppelganger stop holds */
+  int                 hist_warned;      /* we warned of a bad frame and no good one came since */
+
   ulong replay_slot;
   ulong root_slot;
   ulong last_vote_slot;
@@ -296,11 +323,17 @@ privileged_init( fd_topo_t const *      topo,
     fd_keyload_unload( vote_account, 1 );
   }
 
+  /* The votor_hist link puts us in alpenglow mode, HELLO and cfg_hash
+     include the mode. */
+  ctx->mode             = fd_topo_find_tile_in_link( topo, tile, "votor_hist", 0UL )!=ULONG_MAX ? FD_FAILOVER_MODE_ALPENGLOW : FD_FAILOVER_MODE_TOWER;
+  ctx->adopt_anchor     = FD_FAILOVER_SLOT_NULL;
+  ctx->empty_vote_after = FD_FAILOVER_SLOT_NULL;
+
   /* Every boot runs the junk key, so we start as a standby. */
   ctx->role          = FD_FAILOVER_ROLE_STANDBY;
   ctx->hello.version = (ushort)FD_FAILOVER_VERSION;
   ctx->hello.role    = (uchar)ctx->role;
-  ctx->hello.mode    = (uchar)FD_FAILOVER_MODE_TOWER;
+  ctx->hello.mode    = (uchar)ctx->mode;
   while( FD_UNLIKELY( !ctx->hello.boot_id ) ) FD_TEST( fd_rng_secure( &ctx->hello.boot_id, sizeof(ulong) ) );
   /* The commit field has the hash bytes, a build without one leaves it
      zero. */
@@ -368,6 +401,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->admin_in_idx  = ULONG_MAX;
   ctx->adopt_in_idx  = ULONG_MAX;
   ctx->adopt_out_idx = fd_topo_find_tile_out_link( topo, tile, "failov_tower", 0UL );
+  if( FD_UNLIKELY( ctx->adopt_out_idx==ULONG_MAX ) ) ctx->adopt_out_idx = fd_topo_find_tile_out_link( topo, tile, "failov_votor", 0UL );
   if( FD_LIKELY( ctx->adopt_out_idx!=ULONG_MAX ) ) {
     fd_topo_link_t const * link = &topo->links[ tile->out_link_id[ ctx->adopt_out_idx ] ];
     ctx->adopt_out_mem    = topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ].wksp;
@@ -393,7 +427,7 @@ unprivileged_init( fd_topo_t const *      topo,
       ctx->gossip_in_mtu    = link->mtu;
       continue;
     }
-    if( FD_LIKELY( !strcmp( link->name, "tower_failov" ) ) ) {
+    if( FD_LIKELY( !strcmp( link->name, "tower_failov" ) || !strcmp( link->name, "votor_failov" ) ) ) {
       ctx->adopt_in_idx    = i;
       ctx->adopt_in_mem    = topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ].wksp;
       ctx->adopt_in_chunk0 = fd_dcache_compact_chunk0( ctx->adopt_in_mem, link->dcache );
@@ -407,7 +441,7 @@ unprivileged_init( fd_topo_t const *      topo,
       ctx->admin_in_wmark  = fd_dcache_compact_wmark ( ctx->admin_in_mem, link->dcache, link->mtu );
       continue;
     }
-    if( FD_LIKELY( !strcmp( link->name, "tower_out" ) ) ) {
+    if( FD_LIKELY( !strcmp( link->name, "tower_out" ) || !strcmp( link->name, "votor_hist" ) ) ) {
       ctx->tower_in_idx    = i;
       ctx->tower_in_mem    = topo->workspaces[ topo->objs[ link->dcache_obj_id ].wksp_id ].wksp;
       ctx->tower_in_chunk0 = fd_dcache_compact_chunk0( ctx->tower_in_mem, link->dcache );
@@ -729,6 +763,68 @@ consume_slot_done( fd_failover_tile_ctx_t *     ctx,
   }
 }
 
+/* The alpenglow twin of prepare_consensus.  The frame already holds the
+   whole history, so its serialized bytes are the final history we hand
+   over.  The bytes go into a scratch buffer first, a failed encode
+   leaves the cached history as it was. */
+static void
+prepare_consensus_alpenglow( fd_failover_tile_ctx_t *    ctx,
+                             fd_votor_hist_msg_t const * hist ) {
+  uchar state[ FD_FAILOVER_ALPENGLOW_STATE_MAX ];
+  ulong state_sz = 0UL;
+  if( FD_UNLIKELY( ag_hist_tip( &hist->hist )!=hist->vote_slot ||
+                   ag_hist_ser( &hist->hist, state, FD_FAILOVER_ALPENGLOW_STATE_MAX, &state_sz ) ) ) {
+    /* Once until a good frame, a bad votor could send one every slot. */
+    if( FD_UNLIKELY( !ctx->hist_warned ) ) FD_LOG_WARNING(( "votor produced a vote history that does not match its slot metadata, until a good one arrives a handoff hands over nothing" ));
+    ctx->hist_warned = 1;
+    return;
+  }
+  ctx->hist_warned = 0;
+  /* An accepted frame clears any gap before it, a complete snapshot
+     supersedes whatever was skipped. */
+  ctx->tower_gap = 0;
+  fd_memcpy( ctx->cs.state, state, state_sz );
+  ctx->cs.valid = 1;
+  ctx->cs.tip   = hist->vote_slot;
+  ctx->cs.sz    = state_sz;
+}
+
+/* The alpenglow twin of consume_slot_done. */
+static void
+consume_hist( fd_failover_tile_ctx_t *    ctx,
+              fd_votor_hist_msg_t const * hist ) {
+  if( FD_LIKELY( hist->replay_slot!=FD_FAILOVER_SLOT_NULL &&
+                 ( ctx->replay_slot==FD_FAILOVER_SLOT_NULL || hist->replay_slot>ctx->replay_slot ) ) )
+    ctx->replay_slot = hist->replay_slot;
+  if( FD_LIKELY( hist->root_slot!=FD_FAILOVER_SLOT_NULL ) ) ctx->root_slot = hist->root_slot;
+  /* The votor saw a vote from our identity it never cast and stopped
+     voting and leading until its next identity switch.  We raise stuck
+     once, status shows the stop while it holds. */
+  if( FD_UNLIKELY( hist->stopped && !ctx->vote_stopped ) ) {
+    FD_LOG_WARNING(( "the votor stopped voting and leading, another machine voted with the staked identity, make sure that machine no longer runs it, "
+                     "then run `failover demote` and `failover promote` here to vote again, the stop lifts only at an identity switch" ));
+    ctx->stuck = 1;
+  }
+  ctx->vote_stopped = !!hist->stopped;
+  int producing = ctx->role==FD_FAILOVER_ROLE_ACTIVE || ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH;
+  if( FD_LIKELY( hist->has_vote && hist->vote_slot!=FD_FAILOVER_SLOT_NULL ) ) {
+    ctx->last_vote_slot = hist->vote_slot;
+    if( FD_LIKELY( producing ) ) {
+      /* Any later promotion has to cover the votes we signed. */
+      if( FD_LIKELY( ctx->own_floor==FD_FAILOVER_SLOT_NULL || hist->vote_slot>ctx->own_floor ) ) ctx->own_floor = hist->vote_slot;
+      prepare_consensus_alpenglow( ctx, hist );
+    }
+  } else if( FD_UNLIKELY( producing && ctx->cs.valid && hist->vote_slot!=FD_FAILOVER_SLOT_NULL && hist->vote_slot>=ctx->last_vote_slot ) ) {
+    /* A frame with no new vote can still change the bytes, a leader slot
+       that moved or a built-but-unsent vote marked bad at the halt.  Its
+       tip can be past our last vote, from slots marked voted while we
+       stood by or votes never sent, and the history we hand over then
+       ends there. */
+    ctx->last_vote_slot = hist->vote_slot;
+    prepare_consensus_alpenglow( ctx, hist );
+  }
+}
+
 /* Sends the tower we adopt to the tower tile, empty for the vote
    account.  The answer comes back with the request id so we can tell a
    late one apart.  Returns the id, or ULONG_MAX if nothing went out. */
@@ -741,7 +837,7 @@ publish_adopt_state( fd_failover_tile_ctx_t * ctx,
   if( FD_UNLIKELY( !++ctx->adopt_request_id ) ) ctx->adopt_request_id++;
   fd_memcpy( fd_chunk_to_laddr( ctx->adopt_out_mem, ctx->adopt_out_chunk ), ctx->adopt.state, ctx->adopt.sz );
   ulong tspub = fd_frag_meta_ts_comp( fd_tickcount() );
-  ulong ctl = ctx->promote_empty && ctx->promote_force && !ctx->promote_peer ? FD_TOWER_ADOPT_CTL_EMPTY : 0UL;
+  ulong ctl = ctx->mode==FD_FAILOVER_MODE_TOWER && ctx->promote_empty && ctx->promote_force && !ctx->promote_peer ? FD_TOWER_ADOPT_CTL_EMPTY : 0UL;
   fd_stem_publish( stem, ctx->adopt_out_idx, ctx->adopt_request_id, ctx->adopt_out_chunk, ctx->adopt.sz, ctl, tspub, tspub );
   ctx->adopt_out_chunk    = fd_dcache_compact_next( ctx->adopt_out_chunk, ctx->adopt.sz, ctx->adopt_out_chunk0, ctx->adopt_out_wmark );
   ctx->adopt_result_fresh = 0;
@@ -848,7 +944,8 @@ final_tower_ok( fd_failover_tile_ctx_t const * ctx ) {
 static void
 demotion_switched( fd_failover_tile_ctx_t * ctx ) {
   set_role( ctx, FD_FAILOVER_ROLE_STANDBY );
-  FD_LOG_NOTICE(( "handoff/demotion %lu: the tower drained, we are a standby now", ctx->handoff_id ));
+  if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_NOTICE(( "handoff/demotion %lu: the tower drained, we are a standby now", ctx->handoff_id ));
+  else                                                FD_LOG_NOTICE(( "handoff/demotion %lu: the vote history stream drained, we are a standby now", ctx->handoff_id ));
 
   int final_ok = final_tower_ok( ctx );
   if( FD_LIKELY( final_ok ) ) ctx->own_tower = ctx->cs;
@@ -861,7 +958,9 @@ demotion_switched( fd_failover_tile_ctx_t * ctx ) {
     if( FD_UNLIKELY( !final_ok ) ) {
       /* A demote without a final tower leaves no own final tower either,
          so a later promote here needs the vote account. */
-      FD_LOG_WARNING(( "demotion %lu has no final tower for its last vote %lu, nobody votes until `failover promote --force` runs on one machine", ctx->handoff_id, ctx->last_vote_slot ));
+      if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_WARNING(( "demotion %lu has no final tower for its last vote %lu, nobody votes until `failover promote --force` runs on one machine", ctx->handoff_id, ctx->last_vote_slot ));
+      else                                                FD_LOG_WARNING(( "demotion %lu has no final vote history for its last vote %lu, nobody votes now, "
+                                                                           "`failover promote --force` on either machine takes the identity", ctx->handoff_id, ctx->last_vote_slot ));
       demotion_abort( ctx );
       return;
     }
@@ -870,14 +969,19 @@ demotion_switched( fd_failover_tile_ctx_t * ctx ) {
     return;
   }
 
-  ctx->demoted_sz = final_ok
-                  ? fd_failover_demoted_encode( ctx->demoted, ctx->handoff_id, ctx->handoff_target, ctx->last_vote_slot,
-                                                ctx->cs.state, ctx->cs.sz )
-                  : 0UL;
+  ctx->demoted_sz = !final_ok
+                  ? 0UL
+                  : ctx->mode==FD_FAILOVER_MODE_ALPENGLOW
+                  ? fd_failover_demoted_encode_alpenglow( ctx->demoted, ctx->handoff_id, ctx->handoff_target, ctx->last_vote_slot,
+                                                          ctx->cs.state, ctx->cs.sz )
+                  : fd_failover_demoted_encode( ctx->demoted, ctx->handoff_id, ctx->handoff_target, ctx->last_vote_slot,
+                                                ctx->cs.state, ctx->cs.sz );
   if( FD_UNLIKELY( !ctx->demoted_sz ) ) {
     /* We have no final tower to hand over, or the one we have is not the
        tower of our last vote.  The peer gets nothing and cannot promote. */
-    FD_LOG_WARNING(( "demotion %lu has no final tower for its last vote %lu, sending nothing, nobody votes until `failover promote --force` runs on one machine", ctx->handoff_id, ctx->last_vote_slot ));
+    if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_WARNING(( "demotion %lu has no final tower for its last vote %lu, sending nothing, nobody votes until `failover promote --force` runs on one machine", ctx->handoff_id, ctx->last_vote_slot ));
+    else                                                FD_LOG_WARNING(( "demotion %lu has no final vote history for its last vote %lu, sending nothing, nobody votes now, "
+                                                                         "`failover promote --force` on either machine takes the identity", ctx->handoff_id, ctx->last_vote_slot ));
     demotion_abort( ctx );
     return;
   }
@@ -913,11 +1017,13 @@ adopt_err_name( ulong result ) {
 }
 
 static char const *
-source_name( ulong source ) {
+source_name( ulong mode,
+             ulong source ) {
+  int alpenglow = mode==FD_FAILOVER_MODE_ALPENGLOW;
   switch( source ) {
-  case FD_FAILOVER_SOURCE_PEER:         return "the tower the peer gave us";
-  case FD_FAILOVER_SOURCE_OWN:          return "our own final tower";
-  case FD_FAILOVER_SOURCE_VOTE_ACCOUNT: return "the vote account";
+  case FD_FAILOVER_SOURCE_PEER:         return alpenglow ? "the vote history the peer gave us" : "the tower the peer gave us";
+  case FD_FAILOVER_SOURCE_OWN:          return alpenglow ? "our own final vote history"        : "our own final tower";
+  case FD_FAILOVER_SOURCE_VOTE_ACCOUNT: return alpenglow ? "an empty history"                  : "the vote account";
   default:                              return "unknown";
   }
 }
@@ -971,6 +1077,9 @@ control_refusal( ulong         result,
   case FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER:
     *hint = "the active has no eligible final vote state to hand over and keeps the identity, its log explains whether no vote is known or history is missing, check its voting progress before retrying";
     return "NO_FINAL_TOWER";
+  case FD_FAILOVER_CONTROL_RESULT_NO_HISTORY:
+    *hint = "there is no vote history to adopt, `failover promote --force` starts from an empty history";
+    return "NO_HISTORY";
   default:
     *hint = "the failover tile does not know this command";
     return "UNSUPPORTED";
@@ -1011,6 +1120,54 @@ coverage_floor( fd_failover_tile_ctx_t const * ctx ) {
   return fd_ulong_max( ctx->peer_floor, ctx->own_floor );
 }
 
+/* Saved history waits for its finality anchor.  Empty recovery is an
+   explicit FORCE override: fence future votes at our replay position,
+   without waiting for missing peer history.  The votor retains this
+   machine's existing vote marks and any stronger local bound. */
+static void
+alpenglow_promote_start( fd_failover_tile_ctx_t * ctx ) {
+  ctx->adopt_anchor     = FD_FAILOVER_SLOT_NULL;
+  ctx->empty_vote_after = FD_FAILOVER_SLOT_NULL;
+  if( FD_LIKELY( ctx->promote_source!=FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) ) {
+    ag_hist_t hist[1];
+    if( FD_LIKELY( !ag_hist_de( ctx->adopt.state, ctx->adopt.sz, hist ) ) ) ctx->adopt_anchor = hist->anchor;
+  }
+}
+
+static int
+alpenglow_replay_ready( fd_failover_tile_ctx_t * ctx ) {
+  if( FD_LIKELY( ctx->promote_source!=FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) )
+    return ctx->adopt_anchor==FD_FAILOVER_SLOT_NULL || ctx->replay_slot>=ctx->adopt_anchor;
+  if( FD_UNLIKELY( !ctx->promote_force ) ) {
+    FD_LOG_WARNING(( "%s: no eligible saved vote history is available, Alpenglow has no vote-account history source, so empty-history promotion requires --force after the peer is fenced", ctx->promote_label ));
+    reject_promotion( ctx, FD_FAILOVER_REJECT_ADOPTION_FAILED, 0 );
+    return 0;
+  }
+  ctx->empty_vote_after = ctx->replay_slot;
+  char floor[32];
+  FD_LOG_WARNING(( "%s: --force accepts empty Alpenglow history, no vote at or below replay slot %lu, known peer history through %s may be missing, local vote marks and stronger local bounds remain",
+                   ctx->promote_label, ctx->empty_vote_after, slot_text( ctx->promote_floor, floor ) ));
+  FD_STORE( ulong, ctx->adopt.state, ctx->empty_vote_after );
+  ctx->adopt.sz = FD_VOTOR_ADOPT_EMPTY_SZ;
+  return 1;
+}
+
+/* Says what the votor took, the history's tip and anchor or the empty
+   history.  Its answer has the vote bound where the tower tile's has
+   acct_vote_slot. */
+static void
+alpenglow_adopted( fd_failover_tile_ctx_t const * ctx ) {
+  ulong bound = ctx->adopt_result.acct_vote_slot;
+  if( FD_UNLIKELY( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) ) {
+    FD_LOG_NOTICE(( "the votor started an empty vote history, no vote at or below slot %lu", bound ));
+  } else if( FD_LIKELY( bound==FD_FAILOVER_SLOT_NULL ) ) {
+    FD_LOG_NOTICE(( "the votor adopted the vote history ending at slot %lu, finality anchor at slot %lu", ctx->adopt_result.vote_slot, ctx->adopt_anchor ));
+  } else {
+    FD_LOG_NOTICE(( "the votor adopted the vote history ending at slot %lu, finality anchor at slot %lu, no vote at or below slot %lu",
+                    ctx->adopt_result.vote_slot, ctx->adopt_anchor, bound ));
+  }
+}
+
 /* Take the staked identity with the tower from source.  from_peer is set
    when the peer's DEMOTED asked for it, the caller set promote_boot_id
    and promote_handoff_id for the answer. */
@@ -1049,11 +1206,19 @@ start_promotion( fd_failover_tile_ctx_t * ctx,
   ctx->floor_logged   = 0;
   ctx->retry_logged   = 0;
   ctx->stuck          = 0;
+  if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) alpenglow_promote_start( ctx );
   deadline_start( ctx, FD_FAILOVER_DEADLINE_SLOTS );
   ctx->action = FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY;
-  if( FD_UNLIKELY( from_peer && ctx->adopt.tip!=FD_FAILOVER_SLOT_NULL &&
-                   ( ctx->replay_slot==FD_FAILOVER_SLOT_NULL || ctx->replay_slot<ctx->adopt.tip ) ) ) {
-    FD_LOG_NOTICE(( "%s: the promotion waits for replay to reach slot %lu before it adopts %s", ctx->promote_label, ctx->adopt.tip, source_name( source ) ));
+  if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) {
+    /* A vote history waits for its finality anchor, an empty one said
+       its bound already. */
+    if( FD_UNLIKELY( from_peer && ctx->adopt_anchor!=FD_FAILOVER_SLOT_NULL &&
+                     ( ctx->replay_slot==FD_FAILOVER_SLOT_NULL || ctx->replay_slot<ctx->adopt_anchor ) ) ) {
+      FD_LOG_NOTICE(( "%s: the promotion waits for replay to reach the finality anchor at slot %lu before it adopts %s", ctx->promote_label, ctx->adopt_anchor, source_name( ctx->mode, source ) ));
+    }
+  } else if( FD_UNLIKELY( from_peer && ctx->adopt.tip!=FD_FAILOVER_SLOT_NULL &&
+                          ( ctx->replay_slot==FD_FAILOVER_SLOT_NULL || ctx->replay_slot<ctx->adopt.tip ) ) ) {
+    FD_LOG_NOTICE(( "%s: the promotion waits for replay to reach slot %lu before it adopts %s", ctx->promote_label, ctx->adopt.tip, source_name( ctx->mode, source ) ));
   }
 }
 
@@ -1066,13 +1231,13 @@ promote_fallback( fd_failover_tile_ctx_t * ctx,
                   char const *            reason ) {
   if( FD_UNLIKELY( ctx->promote_peer || ctx->promote_empty ) ) return 0;
   if( ctx->promote_source!=FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) {
-    FD_LOG_NOTICE(( "%s: %s is not eligible (%s), trying the vote account", ctx->promote_label,
-                    source_name( ctx->promote_source ), reason ));
+    FD_LOG_NOTICE(( "%s: %s is not eligible (%s), trying %s", ctx->promote_label,
+                    source_name( ctx->mode, ctx->promote_source ), reason, source_name( ctx->mode, FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) ));
     if( ctx->promote_source==FD_FAILOVER_SOURCE_PEER ) ctx->peer_tower.valid = 0;
     if( ctx->promote_source==FD_FAILOVER_SOURCE_OWN  ) ctx->own_tower.valid = 0;
     ctx->promote_source = FD_FAILOVER_SOURCE_VOTE_ACCOUNT;
   } else {
-    if( !ctx->promote_force ) return 0;
+    if( !ctx->promote_force || ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) return 0;
     FD_LOG_WARNING(( "%s: the vote account cannot be adopted (%s), --force proceeds with an empty tower", ctx->promote_label, reason ));
     ctx->promote_empty = 1;
   }
@@ -1083,6 +1248,7 @@ promote_fallback( fd_failover_tile_ctx_t * ctx,
   ctx->last_vote_slot = FD_FAILOVER_SLOT_NULL;
   ctx->adopt_retry = 0;
   ctx->adopt_result_fresh = 0;
+  if( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) alpenglow_promote_start( ctx );
   ctx->action = FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY;
   return 1;
 }
@@ -1095,6 +1261,11 @@ promote_fallback( fd_failover_tile_ctx_t * ctx,
    floor known we go ahead, like an upstream restart. */
 static int
 floor_covered( fd_failover_tile_ctx_t const * ctx ) {
+  /* An empty Alpenglow history preserves only its local vote bound.
+     FORCE decides whether missing peer history can be overridden. */
+  if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW && ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) )
+    return ctx->promote_floor==FD_FAILOVER_SLOT_NULL ||
+           ( ctx->adopt_result.acct_vote_slot!=FD_FAILOVER_SLOT_NULL && ctx->adopt_result.acct_vote_slot>=ctx->promote_floor );
   ulong floor = ctx->promote_floor;
   ulong tip   = ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT ? ctx->adopt_result.acct_vote_slot
                                                                      : ctx->adopt_result.vote_slot;
@@ -1105,7 +1276,7 @@ floor_covered( fd_failover_tile_ctx_t const * ctx ) {
          ctx->replay_slot>fd_ulong_sat_add( floor, FD_FAILOVER_FLOOR_SLACK_SLOTS );
 }
 
-/* The bound DEMOTED supersedes that session's initial ACTIVE HELLO.
+/* The bound DEMOTED supersedes the initial ACTIVE HELLO.
    A later ACTIVE authentication is new evidence, retained if the
    connection drops.  An operator promote also watches gossip. */
 static int
@@ -1172,14 +1343,17 @@ step_controller( fd_failover_tile_ctx_t * ctx,
        be missing from DEMOTED.  Same link, same counter, so the wait is
        exact. */
     if( FD_UNLIKELY( !ctx->drain_logged ) ) {
-      FD_LOG_NOTICE(( "handoff/demotion %lu: the junk identity is installed, waiting for the tower to drain up to seq %lu", ctx->handoff_id, ctx->switch_result.tower_watermark ));
+      if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_NOTICE(( "handoff/demotion %lu: the junk identity is installed, waiting for the tower to drain up to seq %lu", ctx->handoff_id, ctx->switch_result.tower_watermark ));
+      else                                                FD_LOG_NOTICE(( "handoff/demotion %lu: the junk identity is installed, waiting for the vote history stream to drain up to seq %lu", ctx->handoff_id, ctx->switch_result.tower_watermark ));
       ctx->drain_logged = 1;
     }
     if( FD_UNLIKELY( !fd_seq_ge( fd_seq_inc( ctx->tower_seen_seq, 1UL ), ctx->switch_result.tower_watermark ) ) ) {
       if( FD_UNLIKELY( expired ) ) {
         /* The identity is gone from here, so we stand by and send
            nothing, nobody can promote on it. */
-        FD_LOG_WARNING(( "the tower stream never reached the watermark %lu, demotion %lu sends nothing, nobody votes until `failover promote --force` runs on one machine", ctx->switch_result.tower_watermark, ctx->handoff_id ));
+        if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_WARNING(( "the tower stream never reached the watermark %lu, demotion %lu sends nothing, nobody votes until `failover promote --force` runs on one machine", ctx->switch_result.tower_watermark, ctx->handoff_id ));
+        else                                                FD_LOG_WARNING(( "the vote history stream never reached the watermark %lu, demotion %lu sends nothing, nobody votes now, "
+                                                                             "`failover promote --force` on either machine takes the identity", ctx->switch_result.tower_watermark, ctx->handoff_id ));
         ctx->switch_result_fresh = 0;
         ctx->switch_overdue      = 0;
         set_role( ctx, FD_FAILOVER_ROLE_STANDBY );
@@ -1230,8 +1404,12 @@ step_controller( fd_failover_tile_ctx_t * ctx,
     /* Wait for replay to reach the tower's tip before adopting, otherwise
        the tower refers to blocks we have not seen yet. */
     if( FD_UNLIKELY( ctx->replay_slot==FD_FAILOVER_SLOT_NULL ) ) return;
-    if( FD_UNLIKELY( ctx->adopt.tip!=FD_FAILOVER_SLOT_NULL && ctx->replay_slot<ctx->adopt.tip ) ) {
+    if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER && ctx->adopt.tip!=FD_FAILOVER_SLOT_NULL && ctx->replay_slot<ctx->adopt.tip ) ) {
       (void)promote_fallback( ctx, "replay has not reached its tip" );
+      return;
+    }
+    if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW && !alpenglow_replay_ready( ctx ) ) ) {
+      if( ctx->promote_source!=FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) (void)promote_fallback( ctx, "replay has not reached its finality anchor" );
       return;
     }
     ulong id = publish_adopt_state( ctx, stem );
@@ -1239,8 +1417,9 @@ step_controller( fd_failover_tile_ctx_t * ctx,
       reject_promotion( ctx, FD_FAILOVER_REJECT_ADOPTION_FAILED, 0 );
       return;
     }
-    FD_LOG_NOTICE(( "%s: asking the tower tile to adopt %s", ctx->promote_label,
-                    ctx->promote_empty ? "an empty tower authorized by --force" : source_name( ctx->promote_source ) ));
+    if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_NOTICE(( "%s: asking the tower tile to adopt %s", ctx->promote_label,
+                    ctx->promote_empty ? "an empty tower authorized by --force" : source_name( ctx->mode, ctx->promote_source ) ));
+    else                                                FD_LOG_NOTICE(( "%s: asking the votor to adopt %s", ctx->promote_label, source_name( ctx->mode, ctx->promote_source ) ));
     ctx->adopt_expected_id = id;
     ctx->adopt_retry       = 0;
     ctx->action            = FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT;
@@ -1287,7 +1466,8 @@ step_controller( fd_failover_tile_ctx_t * ctx,
     }
     if( FD_UNLIKELY( ctx->adopt_result.result!=FD_TOWER_ADOPT_SUCCESS ) ) {
       if( promote_fallback( ctx, adopt_err_name( ctx->adopt_result.result ) ) ) return;
-      FD_LOG_WARNING(( "%s: the tower tile refused %s (%s)", ctx->promote_label, source_name( ctx->promote_source ), adopt_err_name( ctx->adopt_result.result ) ));
+      if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_WARNING(( "%s: the tower tile refused %s (%s)", ctx->promote_label, source_name( ctx->mode, ctx->promote_source ), adopt_err_name( ctx->adopt_result.result ) ));
+      else                                                FD_LOG_WARNING(( "%s: the votor refused the vote history (%s), `failover status` shows what a promote would adopt now", ctx->promote_label, adopt_err_name( ctx->adopt_result.result ) ));
       ulong result = ctx->adopt_result.result;
       reject_promotion( ctx, result==FD_TOWER_ADOPT_ERR_BLOCK_MISMATCH ? FD_FAILOVER_REJECT_ADOPTION_MISMATCH
                                                                        : FD_FAILOVER_REJECT_ADOPTION_FAILED,
@@ -1300,18 +1480,23 @@ step_controller( fd_failover_tile_ctx_t * ctx,
          that ends short of its last vote would leave lockouts behind.
          That is a mismatch, not a promotion. */
       if( promote_fallback( ctx, "adoption did not retain its final vote" ) ) return;
-      FD_LOG_WARNING(( "%s: the adopted tower ends at slot %lu, the tower says %lu, replay does not have its last vote, so it is a mismatch", ctx->promote_label, ctx->adopt_result.vote_slot, ctx->adopt.tip ));
+      if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_WARNING(( "%s: the adopted tower ends at slot %lu, the tower says %lu, replay does not have its last vote, so it is a mismatch", ctx->promote_label, ctx->adopt_result.vote_slot, ctx->adopt.tip ));
+      else                                                FD_LOG_WARNING(( "%s: the adopted vote history ends at slot %lu, the history says %lu, `failover status` shows what a promote would adopt now", ctx->promote_label, ctx->adopt_result.vote_slot, ctx->adopt.tip ));
       reject_promotion( ctx, FD_FAILOVER_REJECT_ADOPTION_MISMATCH, 1 );
       return;
     }
+    if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) alpenglow_adopted( ctx );
     int covered = floor_covered( ctx );
-    int empty_account = ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && ctx->adopt_result.acct_vote_slot==FD_FAILOVER_SLOT_NULL;
+    int empty_account = ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT &&
+                        ( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW || ctx->adopt_result.acct_vote_slot==FD_FAILOVER_SLOT_NULL );
     if( FD_UNLIKELY( !ctx->promote_peer && ( !covered || empty_account ) ) ) {
       if( ctx->promote_source!=FD_FAILOVER_SOURCE_VOTE_ACCOUNT &&
           promote_fallback( ctx, "its votes do not cover the known signing history" ) ) return;
       if( !ctx->promote_force ) {
         char tip[32], floor[32];
-        if( empty_account )
+        if( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW )
+          FD_LOG_WARNING(( "%s: no eligible saved vote history is available, Alpenglow has no vote-account history source, so empty-history promotion requires --force after the peer is fenced", ctx->promote_label ));
+        else if( empty_account )
           FD_LOG_WARNING(( "%s: no vote history found in the vote account, promotion requires --force after the peer is fenced", ctx->promote_label ));
         else
           FD_LOG_WARNING(( "%s: the vote account has incomplete history (last account vote %s, required coverage floor %s), promotion requires --force after the peer is fenced", ctx->promote_label,
@@ -1319,7 +1504,7 @@ step_controller( fd_failover_tile_ctx_t * ctx,
         reject_promotion( ctx, FD_FAILOVER_REJECT_ADOPTION_FAILED, 0 );
         return;
       }
-      if( !ctx->promote_empty ) {
+      if( ctx->mode==FD_FAILOVER_MODE_TOWER && !ctx->promote_empty ) {
         char tip[32], floor[32];
         FD_LOG_WARNING(( "%s: --force accepts %s vote-account history (last account vote %s, required coverage floor %s), earlier votes and lockouts may be lost", ctx->promote_label,
                          empty_account ? "empty" : "incomplete", slot_text( ctx->adopt_result.acct_vote_slot, tip ), slot_text( ctx->promote_floor, floor ) ));
@@ -1345,7 +1530,7 @@ step_controller( fd_failover_tile_ctx_t * ctx,
           }
         } else {
           FD_LOG_WARNING(( "%s: %s ends at slot %lu, short of the coverage floor at slot %lu, the promotion stops at its deadline", ctx->promote_label,
-                           source_name( ctx->promote_source ), ctx->adopt_result.vote_slot, ctx->promote_floor ));
+                           source_name( ctx->mode, ctx->promote_source ), ctx->adopt_result.vote_slot, ctx->promote_floor ));
         }
         ctx->floor_logged = 1;
       }
@@ -1371,8 +1556,9 @@ step_controller( fd_failover_tile_ctx_t * ctx,
       reject_promotion( ctx, FD_FAILOVER_REJECT_ADOPTION_FAILED, 0 );
       return;
     }
-    FD_LOG_NOTICE(( "%s: the tower tile adopted %s, asking the admin tile to install the staked identity", ctx->promote_label,
-                    ctx->promote_empty ? "an empty tower authorized by --force" : source_name( ctx->promote_source ) ));
+    if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_NOTICE(( "%s: the tower tile adopted %s, asking the admin tile to install the staked identity", ctx->promote_label,
+                    ctx->promote_empty ? "an empty tower authorized by --force" : source_name( ctx->mode, ctx->promote_source ) ));
+    else                                                FD_LOG_NOTICE(( "%s: asking the admin tile to install the staked identity", ctx->promote_label ));
     ctx->action = FD_FAILOVER_ACTION_PROMOTE_SWITCH;
     return;
   }
@@ -1400,7 +1586,13 @@ step_controller( fd_failover_tile_ctx_t * ctx,
     ctx->taken            = 0;
     ctx->action           = FD_FAILOVER_ACTION_IDLE;
     ctx->stuck            = 0;
-    if( FD_UNLIKELY( ctx->last_vote_slot==FD_FAILOVER_SLOT_NULL ) ) {
+    if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) {
+      if( FD_LIKELY( ctx->promote_source!=FD_FAILOVER_SOURCE_VOTE_ACCOUNT ) ) {
+        FD_LOG_NOTICE(( "%s: we are the active now, the staked identity is installed and the adopted vote history ends at slot %lu", ctx->promote_label, ctx->last_vote_slot ));
+      } else {
+        FD_LOG_NOTICE(( "%s: we are the active now, the staked identity is installed with an empty history, no vote at or below slot %lu", ctx->promote_label, ctx->empty_vote_after ));
+      }
+    } else if( FD_UNLIKELY( ctx->last_vote_slot==FD_FAILOVER_SLOT_NULL ) ) {
       FD_LOG_NOTICE(( "%s: we are the active now, the staked identity is installed with %s", ctx->promote_label,
                       ctx->promote_empty ? "an empty tower authorized by --force" : "the vote account's tower" ));
     } else {
@@ -1553,6 +1745,9 @@ handle_control( fd_failover_tile_ctx_t * ctx,
     /* The peer says it can no longer sign and hands us its tower. */
     fd_failover_demoted_t demoted;
     if( FD_UNLIKELY( !fd_failover_demoted_decode( &demoted, ctx->rx, payload_sz ) ) ) break;
+    /* HELLO pairs only members in one mode, a DEMOTED in the other is
+       malformed. */
+    if( FD_UNLIKELY( demoted.mode!=(uchar)ctx->mode ) ) break;
     ulong boot_id = ctx->peer_boot_id;
     fd_failover_hello_t const * peer = fd_failover_channel_peer_hello( ctx->channel );
     /* Bind before deduplication.  An unsolicited DEMOTED cannot change
@@ -1586,7 +1781,8 @@ handle_control( fd_failover_tile_ctx_t * ctx,
       finish_reply( ctx, boot_id, demoted.handoff_id, (ushort)FD_FAILOVER_MSG_PROMOTE_REJECTED, reason );
       return;
     }
-    FD_LOG_NOTICE(( "handoff %lu: accepted the peer's final tower ending at slot %lu, waiting for local adoption before taking the identity", demoted.handoff_id, tower.tip ));
+    if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) FD_LOG_NOTICE(( "handoff %lu: accepted the peer's final tower ending at slot %lu, waiting for local adoption before taking the identity", demoted.handoff_id, tower.tip ));
+    else                                                FD_LOG_NOTICE(( "handoff %lu: accepted the peer's final vote history ending at slot %lu, waiting for local adoption before taking the identity", demoted.handoff_id, tower.tip ));
     if( ctx->peer_floor==FD_FAILOVER_SLOT_NULL || tower.tip>ctx->peer_floor ) ctx->peer_floor = tower.tip;
     ctx->peer_tower         = tower;
     ctx->promote_boot_id    = boot_id;
@@ -1882,14 +2078,14 @@ apply_control( fd_failover_tile_ctx_t *               ctx,
       for( ulong i=0UL; i<2UL; i++ ) if( saved[i]->valid ) {
         ulong floor = coverage_floor( ctx );
         if( floor!=FD_FAILOVER_SLOT_NULL && saved[i]->tip<floor )
-          FD_LOG_NOTICE(( "operator promotion: %s ends at slot %lu below the known signing floor %lu, skipping it", source_name( i ), saved[i]->tip, floor ));
+          FD_LOG_NOTICE(( "operator promotion: %s ends at slot %lu below the known signing floor %lu, skipping it", source_name( ctx->mode, i ), saved[i]->tip, floor ));
         else if( ctx->root_slot!=FD_FAILOVER_SLOT_NULL && saved[i]->tip<=ctx->root_slot )
-          FD_LOG_NOTICE(( "operator promotion: %s ends at slot %lu at or below the local root %lu, skipping it", source_name( i ), saved[i]->tip, ctx->root_slot ));
+          FD_LOG_NOTICE(( "operator promotion: %s ends at slot %lu at or below the local root %lu, skipping it", source_name( ctx->mode, i ), saved[i]->tip, ctx->root_slot ));
       }
-      FD_LOG_NOTICE(( "operator promotion: no eligible saved final tower is available, selecting the vote account" ));
+      FD_LOG_NOTICE(( "operator promotion: no eligible saved final state is available, selecting %s", source_name( ctx->mode, source ) ));
     } else {
       fd_failover_tower_t const * saved = source==FD_FAILOVER_SOURCE_PEER ? &ctx->peer_tower : &ctx->own_tower;
-      FD_LOG_NOTICE(( "operator promotion: selecting %s through slot %lu, the tower tile must validate and adopt it before the staked identity is installed", source_name( source ), saved->tip ));
+      FD_LOG_NOTICE(( "operator promotion: selecting %s through slot %lu, the consensus tile must validate and adopt it before the staked identity is installed", source_name( ctx->mode, source ), saved->tip ));
     }
     start_promotion( ctx, source, 0 );
     ctx->last_requested = 0;
@@ -1928,6 +2124,8 @@ status_snapshot( fd_failover_tile_ctx_t const *       ctx,
   resp->promote_floor  = coverage_floor( ctx );
   resp->promote_result = promote_guard( ctx, now, 0 );
   /* Vote-account eligibility is known only after the tower tile answers. */
+  resp->mode           = (uchar)ctx->mode;
+  resp->vote_stopped   = (uchar)!!ctx->vote_stopped;
 }
 
 /* Answer one bus request.  The admin tile validated the ABI already.
@@ -2026,9 +2224,9 @@ before_frag( fd_failover_tile_ctx_t * ctx,
        watermark in after_frag, once the stem has checked the copy.  One
        abandoned to an overrun must not count, or the final tower would be
        taken from the cache with that vote missing.  Other frags hold no
-       vote and count here. */
+       vote and count here.  Every votor_hist frame counts in after_frag. */
     if( FD_UNLIKELY( ctx->tower_seen_seq!=ULONG_MAX && seq!=fd_seq_inc( ctx->tower_seen_seq, 1UL ) ) ) ctx->tower_gap = 1;
-    if( FD_UNLIKELY( sig!=FD_TOWER_SIG_SLOT_DONE ) ) {
+    if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER && sig!=FD_TOWER_SIG_SLOT_DONE ) ) {
       ctx->tower_seen_seq = seq;
       return 1;
     }
@@ -2051,10 +2249,11 @@ during_frag( fd_failover_tile_ctx_t * ctx,
              ulong                    sz,
              ulong                    ctl FD_PARAM_UNUSED ) {
   if( FD_UNLIKELY( in_idx==ctx->adopt_in_idx ) ) {
-    if( FD_UNLIKELY( chunk<ctx->adopt_in_chunk0 || chunk>ctx->adopt_in_wmark || sz!=sizeof(fd_tower_adopt_result_t) ) ) {
+    ulong result_sz = ctx->mode==FD_FAILOVER_MODE_TOWER ? sizeof(fd_tower_adopt_result_t) : sizeof(fd_votor_adopt_result_t);
+    if( FD_UNLIKELY( chunk<ctx->adopt_in_chunk0 || chunk>ctx->adopt_in_wmark || sz!=result_sz ) ) {
       FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->adopt_in_chunk0, ctx->adopt_in_wmark ));
     }
-    fd_memcpy( &ctx->adopt_result, fd_chunk_to_laddr_const( ctx->adopt_in_mem, chunk ), sizeof(fd_tower_adopt_result_t) );
+    fd_memcpy( &ctx->adopt_result, fd_chunk_to_laddr_const( ctx->adopt_in_mem, chunk ), result_sz );
     return;
   }
   if( FD_UNLIKELY( in_idx==ctx->admin_in_idx ) ) {
@@ -2071,10 +2270,12 @@ during_frag( fd_failover_tile_ctx_t * ctx,
     return;
   }
   if( FD_UNLIKELY( in_idx==ctx->tower_in_idx ) ) {
-    if( FD_UNLIKELY( chunk<ctx->tower_in_chunk0 || chunk>ctx->tower_in_wmark || sz!=sizeof(fd_tower_msg_t) ) ) {
+    ulong frame_sz = ctx->mode==FD_FAILOVER_MODE_TOWER ? sizeof(fd_tower_msg_t) : sizeof(fd_votor_hist_msg_t);
+    if( FD_UNLIKELY( chunk<ctx->tower_in_chunk0 || chunk>ctx->tower_in_wmark || sz!=frame_sz ) ) {
       FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->tower_in_chunk0, ctx->tower_in_wmark ));
     }
-    fd_memcpy( &ctx->slot_done, fd_chunk_to_laddr_const( ctx->tower_in_mem, chunk ), sizeof(fd_tower_slot_done_t) );
+    if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) fd_memcpy( &ctx->slot_done, fd_chunk_to_laddr_const( ctx->tower_in_mem, chunk ), sizeof(fd_tower_slot_done_t) );
+    else                                                fd_memcpy( &ctx->hist,      fd_chunk_to_laddr_const( ctx->tower_in_mem, chunk ), sizeof(fd_votor_hist_msg_t)  );
     return;
   }
   if( FD_UNLIKELY( in_idx!=ctx->gossip_in_idx ) ) return;
@@ -2095,6 +2296,18 @@ during_frag( fd_failover_tile_ctx_t * ctx,
   }
 }
 
+/* The votor's codes past BLOCK_MISMATCH differ from the tower tile's.
+   STALE, a history older than the votes this identity sent from here,
+   reads as a mismatch. */
+static ulong
+votor_adopt_code( ulong result ) {
+  switch( result ) {
+  case FD_VOTOR_ADOPT_ERR_STALE:      return FD_TOWER_ADOPT_ERR_BLOCK_MISMATCH;
+  case FD_VOTOR_ADOPT_ERR_UNREPLAYED: return FD_TOWER_ADOPT_ERR_UNREPLAYED;
+  default:                            return result<=FD_VOTOR_ADOPT_ERR_BLOCK_MISMATCH ? result : FD_TOWER_ADOPT_ERR_INVALID;
+  }
+}
+
 static void
 after_frag( fd_failover_tile_ctx_t * ctx,
             ulong                    in_idx,
@@ -2105,6 +2318,7 @@ after_frag( fd_failover_tile_ctx_t * ctx,
             ulong                    tspub  FD_PARAM_UNUSED,
             fd_stem_context_t *      stem   FD_PARAM_UNUSED ) {
   if( FD_UNLIKELY( in_idx==ctx->adopt_in_idx ) ) {
+    if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) ctx->adopt_result.result = votor_adopt_code( ctx->adopt_result.result );
     ctx->adopt_result_id    = sig;
     ctx->adopt_result_fresh = 1;
     return;
@@ -2140,7 +2354,8 @@ after_credit( fd_failover_tile_ctx_t * ctx,
   if( FD_UNLIKELY( !ctx->member_cert_set ) ) request_member_cert( ctx );
   if( FD_UNLIKELY( ctx->slot_done_fresh ) ) {
     ctx->slot_done_fresh = 0;
-    consume_slot_done( ctx, &ctx->slot_done );
+    if( FD_LIKELY( ctx->mode==FD_FAILOVER_MODE_TOWER ) ) consume_slot_done( ctx, &ctx->slot_done );
+    else                                                consume_hist( ctx, &ctx->hist );
   }
   step_controller( ctx, stem );
 
