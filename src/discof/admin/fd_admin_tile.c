@@ -44,9 +44,9 @@ struct fd_admin_tile_ctx {
   ulong                 failover_nonce;      /* nonce of the parked command */
   ulong                 failover_start_time; /* command start retained until the failover tile answers */
   long                  failover_deadline;   /* tickcount past which we answer unresponsive */
-  char                  failover_args_json[ 64 ]; /* the parked command and its flags for the event, empty for status */
+  char                  failover_args_json[ 96 ]; /* the parked command and its flags for the event, empty for status */
   ulong                 failover_args_json_len;
-  char                  failover_cmd_cstr[ 32 ];  /* the parked command and its flags for the log, empty for status */
+  char                  failover_cmd_cstr[ 48 ];  /* the parked command and its flags for the log, empty for status */
 };
 
 typedef struct fd_admin_tile_ctx fd_admin_tile_ctx_t;
@@ -1337,7 +1337,8 @@ failover_event_args( fd_admin_tile_ctx_t const * ctx,
 /* failover_result_name is the event's custom result for a failover
    command that did not succeed. */
 static char const *
-failover_result_name( ulong result ) {
+failover_result_name( ulong result,
+                      int   alpenglow ) {
   switch( result ) {
     case FD_FAILOVER_CONTROL_RESULT_BUSY:            return "busy";
     case FD_FAILOVER_CONTROL_RESULT_UNRESPONSIVE:    return "unresponsive";
@@ -1345,12 +1346,13 @@ failover_result_name( ulong result ) {
     case FD_FAILOVER_CONTROL_RESULT_IN_PROGRESS:     return "in_progress";
     case FD_FAILOVER_CONTROL_RESULT_NOT_PAIRED:      return "not_paired";
     case FD_FAILOVER_CONTROL_RESULT_PEER_UNREADY:    return "peer_unready";
+    case FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED: return "peer_unverified";
     case FD_FAILOVER_CONTROL_RESULT_PEER_ACTIVE:     return "peer_active";
     case FD_FAILOVER_CONTROL_RESULT_HANDOFF_PENDING: return "handoff_pending";
     case FD_FAILOVER_CONTROL_RESULT_TAKEN:           return "taken";
     case FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN:     return "staked_seen";
-    case FD_FAILOVER_CONTROL_RESULT_NO_TOWER:        return "no_tower";
-    case FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER:  return "no_final_tower";
+    case FD_FAILOVER_CONTROL_RESULT_NO_TOWER:        return alpenglow ? "no_history"       : "no_tower";
+    case FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER:  return alpenglow ? "no_final_history" : "no_final_tower";
     case FD_FAILOVER_CONTROL_RESULT_NO_HISTORY:      return "no_history";
     default:                                         return "refused";
   }
@@ -1361,6 +1363,7 @@ failover_control_complete( fd_admin_tile_ctx_t * ctx,
                            ulong                 result,
                            void const *          resp,
                            ulong                 resp_sz ) {
+  int alpenglow = ctx->vote_tile && !strcmp( ctx->vote_tile, "votor" );
   fd_event_admin_command_t event = {
     .type                = FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL,
     .args_json           = { '{', '}' },
@@ -1383,7 +1386,7 @@ failover_control_complete( fd_admin_tile_ctx_t * ctx,
       report_admin_command_custom_result( failover_event_args( ctx, &event ), "unresponsive" );
       break;
     default:
-      report_admin_command_custom_result( failover_event_args( ctx, &event ), failover_result_name( result ) );
+      report_admin_command_custom_result( failover_event_args( ctx, &event ), failover_result_name( result, alpenglow ) );
       break;
   }
   fd_adminctl_complete_response( ctx->adminctl, ctx->failover_slot_idx, result, resp, resp_sz );
@@ -1391,7 +1394,7 @@ failover_control_complete( fd_admin_tile_ctx_t * ctx,
     if( FD_LIKELY( result==FD_ADMINCTL_RESULT_SUCCESS ) ) {
       FD_LOG_NOTICE(( "`failover %s` accepted by the failover tile, follow it with `failover status`", ctx->failover_cmd_cstr ));
     } else if( FD_UNLIKELY( result!=FD_FAILOVER_CONTROL_RESULT_UNRESPONSIVE ) ) {
-      FD_LOG_WARNING(( "`failover %s` refused by the failover tile (%s), nothing was done, the command prints the reason", ctx->failover_cmd_cstr, failover_result_name( result ) ));
+      FD_LOG_WARNING(( "`failover %s` refused by the failover tile (%s), nothing was done, the command prints the reason", ctx->failover_cmd_cstr, failover_result_name( result, alpenglow ) ));
     }
   }
   ctx->failover_slot_idx      = ULONG_MAX;
@@ -1435,7 +1438,10 @@ failover_control( fd_admin_tile_ctx_t * ctx,
 
   fd_adminctl_failover_control_t req;
   fd_memcpy( &req, data, sizeof(req) );
-  if( FD_UNLIKELY( req.cmd>=FD_ADMINCTL_FAILOVER_CMD_CNT || (req.flags & ~(FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE)) ) ) {
+  if( FD_UNLIKELY( req.cmd>=FD_ADMINCTL_FAILOVER_CMD_CNT ||
+                   (req.flags & ~(FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE)) ||
+                   (req.cmd!=FD_ADMINCTL_FAILOVER_CMD_PROMOTE &&
+                    (req.flags & FD_ADMINCTL_FAILOVER_FLAG_FORCE)) ) ) {
     FD_LOG_WARNING(( "unknown adminctl failover-control cmd %lu flags %lu", req.cmd, req.flags ));
     report_admin_command( &event, FD_EVENT_ADMIN_COMMAND_RESULT_UNKNOWN_COMMAND );
     fd_adminctl_complete( adminctl, slot_idx, FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
@@ -1445,7 +1451,7 @@ failover_control( fd_admin_tile_ctx_t * ctx,
                                  "{\"command\":\"%s\",\"yes\":%s,\"force\":%s}", failover_cmd_name( req.cmd ),
                                  (req.flags & FD_ADMINCTL_FAILOVER_FLAG_YES)   ? "true" : "false",
                                  (req.flags & FD_ADMINCTL_FAILOVER_FLAG_FORCE) ? "true" : "false" ) );
-  char cmd_cstr[ 32 ];
+  char cmd_cstr[ 48 ];
   FD_TEST( fd_cstr_printf_check( cmd_cstr, sizeof(cmd_cstr), NULL, "%s%s%s", failover_cmd_name( req.cmd ),
                                  (req.flags & FD_ADMINCTL_FAILOVER_FLAG_YES)   ? " --yes"   : "",
                                  (req.flags & FD_ADMINCTL_FAILOVER_FLAG_FORCE) ? " --force" : "" ) );

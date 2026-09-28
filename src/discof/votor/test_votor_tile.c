@@ -1509,6 +1509,61 @@ test_root_follow( void ) {
   FD_LOG_NOTICE(( "pass: a standby finalizes from block footer certs alone" ));
 }
 
+/* Use production input initialization with the unpolled keyguard response
+   before adoption, as in topology.c.  Hand-built callback indices hid this
+   routing failure in the other adoption fixtures. */
+static void
+test_input_link_indices( void ) {
+  static fd_topo_t topo;
+  fd_topo_tile_t * tile = &topo.tiles[ 0 ];
+  fd_wksp_t * wksp = fd_wksp_new_anonymous( FD_SHMEM_NORMAL_PAGE_SZ, 4096UL, 0UL, "votor_inputs", 0UL );
+  FD_TEST( wksp );
+  topo.workspaces[ 0 ].wksp = wksp;
+  topo.objs[ 0 ].wksp_id    = 0UL;
+  char const * names[] = { "replay_out", "replay_epoch", "gossip_out", "ipecho_out", "net_votor", "sign_votor", "failov_votor" };
+  tile->in_cnt = sizeof(names)/sizeof(names[0]);
+  for( ulong i=0UL; i<tile->in_cnt; i++ ) {
+    fd_topo_link_t * link = &topo.links[ i ];
+    fd_cstr_ncpy( link->name, names[ i ], sizeof(link->name) );
+    link->mtu = AG_HIST_SER_MAX;
+    ulong data_sz = fd_dcache_req_data_sz( link->mtu, 4UL, 1UL, 1 );
+    void * mem = fd_wksp_alloc_laddr( wksp, fd_dcache_align(), fd_dcache_footprint( data_sz, 0UL ), 1UL );
+    FD_TEST( mem );
+    link->dcache = fd_dcache_join( fd_dcache_new( mem, data_sz, 0UL ) );
+    FD_TEST( link->dcache );
+    tile->in_link_id[ i ]   = i;
+    tile->in_link_poll[ i ] = strcmp( names[ i ], "sign_votor" )!=0;
+  }
+
+  fd_pubkey_t a = pubkey( 0x41 );
+  fd_pubkey_t b = pubkey( 0x42 );
+  fd_votor_tile_t * ctx = fixture_new( &a );
+  enable_failover( ctx );
+  build_epoch_info( &a, &b );
+  start_consensus( ctx, 0UL );
+  init_input_links( ctx, &topo, tile );
+
+  /* Derive the callback index by excluding unpolled links, as stem does. */
+  ulong callback_idx = 0UL;
+  for( ulong i=0UL; i<6UL; i++ ) callback_idx += !!tile->in_link_poll[ i ];
+  FD_TEST( callback_idx==5UL );
+  fd_topo_link_t const * link = &topo.links[ 6 ];
+  FD_STORE( ulong, link->dcache, 9UL );
+  ulong chunk = fd_dcache_compact_chunk0( wksp, link->dcache );
+  FD_TEST( !before_frag( ctx, callback_idx, 0UL, 901UL ) );
+  during_frag( ctx, callback_idx, 0UL, 901UL, chunk, FD_VOTOR_ADOPT_EMPTY_SZ, 0UL );
+  after_frag( ctx, callback_idx, 0UL, 901UL, FD_VOTOR_ADOPT_EMPTY_SZ, 0UL, 0UL, stem );
+  fd_votor_adopt_result_t const * reply = adopt_reply( 0UL, 901UL );
+  FD_TEST( reply->result==FD_VOTOR_ADOPT_SUCCESS && reply->vote_bound==9UL );
+  FD_TEST( ctx->failover_hist_adopted && out_seqs[ OUT_IDX_FAILOV ]==1UL );
+  FD_TEST( ctx->in_kind[ callback_idx ]==IN_KIND_FAILOV );
+  FD_TEST( ctx->in[ callback_idx ].chunk0==chunk && ctx->in[ callback_idx ].mtu==link->mtu );
+
+  fixture_delete( ctx );
+  fd_wksp_delete_anonymous( wksp );
+  FD_LOG_NOTICE(( "pass: production input initialization routes adoption past the unpolled signer link" ));
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -1531,6 +1586,7 @@ main( int     argc,
   fd_sha512_t sha[ 1 ];
   fd_ed25519_public_from_private( test_keypair+32UL, test_keypair, sha );
 
+  test_input_link_indices();
   test_rank_voters_resets_total_stake();
   test_switch_completes_uninitialised();
   test_switch_closes_and_reconnects();

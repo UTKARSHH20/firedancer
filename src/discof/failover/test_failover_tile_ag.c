@@ -332,7 +332,8 @@ deliver_adopt( fd_failover_tile_ctx_t * ctx,
                ulong                    result,
                ulong                    vote_slot ) {
   ulong chunk = ctx->adopt_in_chunk0;
-  fd_votor_adopt_result_t res = { .result=result, .root=90UL, .vote_slot=vote_slot };
+  fd_votor_adopt_result_t res = { .result=result, .root=90UL, .vote_slot=vote_slot,
+                                  .vote_bound=ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT ? ctx->empty_vote_after : FD_FAILOVER_SLOT_NULL };
   fd_memcpy( fd_chunk_to_laddr( ctx->adopt_in_mem, chunk ), &res, sizeof(res) );
   FD_TEST( !before_frag( ctx, ctx->adopt_in_idx, 0UL, id ) );
   during_frag( ctx, ctx->adopt_in_idx, 0UL, id, chunk, sizeof(res), 0UL );
@@ -727,7 +728,7 @@ test_promote_wait_replay( void ) {
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   ctx->replay_slot = 190UL;
   make_hist_tower( &ctx->peer_tower, 191UL, 200UL, 6UL );
-  start_promotion( ctx, FD_FAILOVER_SOURCE_PEER, 0 );
+  start_promotion( ctx, FD_FAILOVER_SOURCE_PEER, 1 );
   FD_TEST( ctx->adopt_anchor==191UL );
   step_controller( ctx, stem );
   step_controller( ctx, stem );
@@ -740,91 +741,92 @@ test_promote_wait_replay( void ) {
   FD_LOG_NOTICE(( "pass: an alpenglow promotion waits for replay to reach the history's anchor" ));
 }
 
-/* test_empty_history: with no history promote needs --yes.  The empty
-   adopt request is the bound alone, the last slot of the window after
-   the one holding the peer's aged last vote or the highest slot seen at
-   promote, and it goes out once replay passed the bound. */
+/* Empty Alpenglow history is a FORCE override, adopted through votor
+   before switching. It keeps a local replay bound without waiting for
+   an unavailable peer's history. */
 static void
 test_empty_history( void ) {
-  long  now  = fd_failover_clock();
-  long  past = now-FD_FAILOVER_CHANNEL_SILENCE_NANOS;
-  ulong yes  = FD_ADMINCTL_FAILOVER_FLAG_YES;
-
+  long now = fd_failover_clock();
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_FAILOVER_CONTROL_RESULT_NO_HISTORY );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES, now )==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE );
   fd_adminctl_failover_status_resp_t status;
   status_snapshot( ctx, now, &status );
   FD_TEST( status.mode==(uchar)FD_FAILOVER_MODE_ALPENGLOW && status.promote_source==(uchar)FD_FAILOVER_SOURCE_VOTE_ACCOUNT );
-  FD_TEST( status.promote_result==FD_FAILOVER_CONTROL_RESULT_NO_HISTORY );
-  char const * hint;
-  FD_TEST( !strcmp( control_refusal( FD_FAILOVER_CONTROL_RESULT_NO_HISTORY, &hint ), "NO_HISTORY" ) );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, now )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && ctx->empty_vote_after==107UL );
+  FD_TEST( status.promote_result==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, now )==FD_ADMINCTL_RESULT_SUCCESS );
   step_controller( ctx, stem );
-  ctx->replay_slot = 107UL;
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && ctx->empty_vote_after==100UL );
+  FD_TEST( pub_mcache[0].sz==FD_VOTOR_ADOPT_EMPTY_SZ && FD_LOAD( ulong, bus_mem )==100UL && !pub_mcache[0].ctl );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, now )==FD_FAILOVER_CONTROL_RESULT_IN_PROGRESS );
+  deliver_adopt( ctx, ctx->adopt_expected_id+1UL, FD_VOTOR_ADOPT_SUCCESS, FD_FAILOVER_SLOT_NULL );
   step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && !stem->seqs[ 0 ] );
-  ctx->replay_slot++;
-  step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && pub_mcache[ 0 ].sig==ctx->adopt_expected_id );
-  FD_TEST( pub_mcache[ 0 ].sz==FD_VOTOR_ADOPT_EMPTY_SZ && FD_LOAD( ulong, bus_mem )==107UL );
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT );
   deliver_adopt( ctx, ctx->adopt_expected_id, FD_VOTOR_ADOPT_SUCCESS, FD_FAILOVER_SLOT_NULL );
   step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH && ctx->last_vote_slot==FD_FAILOVER_SLOT_NULL );
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH );
   switch_ok( ctx, 0UL );
   step_controller( ctx, stem );
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_ACTIVE && !ctx->stuck );
   controller_fini( ctx );
 
-  /* The peer's last reported vote is past what we have seen, and its
-     STATUS is a bit over 10 slots old, 11 rounded up.  The floor is
-     covered by the wait, not by the tower rule. */
-  ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  peer_says( ctx, FD_FAILOVER_ROLE_ACTIVE, 150UL, past );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, now )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ctx->promote_floor==150UL && ctx->empty_vote_after==155UL );
-  ctx->replay_slot = 155UL;
-  step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && !stem->seqs[ 0 ] );
-  ctx->replay_slot++;
-  step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
-  FD_TEST( pub_mcache[ 0 ].sz==FD_VOTOR_ADOPT_EMPTY_SZ && FD_LOAD( ulong, bus_mem )==155UL );
-  deliver_adopt( ctx, ctx->adopt_expected_id, FD_VOTOR_ADOPT_SUCCESS, FD_FAILOVER_SLOT_NULL );
-  step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH );
-  controller_fini( ctx );
-
-  /* Replay is past the peer's aged last vote, the bound counts from
-     replay. */
-  ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  peer_says( ctx, FD_FAILOVER_ROLE_ACTIVE, 150UL, past );
-  ctx->replay_slot = 200UL;
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, now )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ctx->promote_floor==150UL && ctx->empty_vote_after==207UL );
-  ctx->replay_slot = 208UL;
-  step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
-  FD_TEST( pub_mcache[ 0 ].sz==FD_VOTOR_ADOPT_EMPTY_SZ && FD_LOAD( ulong, bus_mem )==207UL );
-  controller_fini( ctx );
-
-  /* Nothing seen at promote, the window counts from the first replayed
-     slot. */
+  /* Force still needs a local replay position and initialized consensus. */
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   ctx->replay_slot = FD_FAILOVER_SLOT_NULL;
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, now )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ctx->empty_vote_after==FD_FAILOVER_SLOT_NULL );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, now )==FD_ADMINCTL_RESULT_SUCCESS );
   step_controller( ctx, stem );
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && !stem->seqs[0] );
   ctx->replay_slot = 300UL;
   step_controller( ctx, stem );
-  FD_TEST( ctx->empty_vote_after==307UL && ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY );
-  ctx->replay_slot = 308UL;
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && FD_LOAD( ulong, bus_mem )==300UL );
+  deliver_adopt( ctx, ctx->adopt_expected_id, FD_VOTOR_ADOPT_ERR_INVALID, FD_FAILOVER_SLOT_NULL );
   step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
-  FD_TEST( pub_mcache[ 0 ].sz==FD_VOTOR_ADOPT_EMPTY_SZ && FD_LOAD( ulong, bus_mem )==307UL );
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE && ctx->stuck && ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT );
   controller_fini( ctx );
-  FD_LOG_NOTICE(( "pass: an empty history sends its bound once replay passed it" ));
+
+  /* Even independently verified peer authority cannot authorize empty
+     history without FORCE. No request goes to votor in that case. */
+  ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
+  start_promotion( ctx, FD_FAILOVER_SOURCE_VOTE_ACCOUNT, 0 );
+  step_controller( ctx, stem );
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE && ctx->stuck && !stem->seqs[0] );
+  controller_fini( ctx );
+  FD_LOG_NOTICE(( "pass: forced empty Alpenglow recovery waits for matching adoption, not missing peer history" ));
+}
+
+static void
+test_automatic_history( void ) {
+  ulong errors[] = { FD_VOTOR_ADOPT_ERR_DECODE, FD_VOTOR_ADOPT_ERR_INVALID,
+                     FD_VOTOR_ADOPT_ERR_STALE, FD_VOTOR_ADOPT_ERR_UNREPLAYED_ROOT, FD_VOTOR_ADOPT_SUCCESS };
+  for( int own=0; own<2; own++ ) for( ulong i=0UL; i<sizeof(errors)/sizeof(errors[0]); i++ ) {
+    fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
+    make_hist_tower( own ? &ctx->own_tower : &ctx->peer_tower, 90UL, 99UL, 6UL );
+    FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, fd_failover_clock() )==FD_ADMINCTL_RESULT_SUCCESS );
+    step_controller( ctx, stem );
+    ulong first = ctx->adopt_expected_id;
+    deliver_adopt( ctx, first, errors[i], 98UL );
+    step_controller( ctx, stem );
+    FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT );
+    FD_TEST( !(own ? ctx->own_tower.valid : ctx->peer_tower.valid) && ctx->promote_force && !ctx->promote_empty );
+    step_controller( ctx, stem );
+    FD_TEST( ctx->adopt_expected_id!=first && pub_mcache[1].sz==FD_VOTOR_ADOPT_EMPTY_SZ && !pub_mcache[1].ctl );
+    deliver_adopt( ctx, first, FD_VOTOR_ADOPT_SUCCESS, 99UL );
+    step_controller( ctx, stem );
+    FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT );
+    deliver_adopt( ctx, ctx->adopt_expected_id, FD_VOTOR_ADOPT_SUCCESS, FD_FAILOVER_SLOT_NULL );
+    step_controller( ctx, stem );
+    FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH );
+    controller_fini( ctx );
+  }
+  fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
+  make_hist_tower( &ctx->own_tower, 191UL, 200UL, 6UL );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, fd_failover_clock() )==FD_ADMINCTL_RESULT_SUCCESS );
+  step_controller( ctx, stem );
+  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !stem->seqs[0] );
+  step_controller( ctx, stem );
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && FD_LOAD( ulong, bus_mem )==100UL );
+  controller_fini( ctx );
+  FD_LOG_NOTICE(( "pass: unusable saved Alpenglow history falls back automatically, stale answers never authorize switching" ));
 }
 
 /* test_leader_after_promote: after a promotion a frame with no vote
@@ -928,38 +930,27 @@ test_vote_stopped( void ) {
   FD_LOG_NOTICE(( "pass: a doppelganger stop raises stuck once and shows in status" ));
 }
 
-/* test_empty_history_window: the active died and promote --force --yes
-   runs at once.  The bound covers the votes the peer may have cast
-   since its last STATUS, one per slot time up to 12 and a skip on the
-   rest of any window it entered. */
-
-/* test_empty_history_raise: the bound is counted again as the empty
-   adopt request goes out, from a coverage floor a STATUS during the
-   replay wait raised and the peer's last vote aged until then. */
-
+/* FORCE does not wait for a peer floor in any replay-window phase. */
 static void
 test_empty_history_window( void ) {
-  for( ulong replay=96UL; replay<112UL; replay++ ) {
-    for( ulong floor=96UL; floor<112UL; floor++ ) {
-      fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-      ctx->replay_slot = replay;
-      ctx->peer_floor = floor;
-      ulong highest = replay>floor ? replay : floor;
-      ulong expected = (highest/4UL+2UL)*4UL-1UL;
-      FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES, fd_failover_clock() )==FD_ADMINCTL_RESULT_SUCCESS );
-      FD_TEST( ctx->empty_vote_after==expected );
-      ctx->replay_slot = expected;
-      step_controller( ctx, stem );
-      FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && !stem->seqs[0] );
-      ctx->replay_slot++;
-      step_controller( ctx, stem );
-      FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
-      FD_TEST( FD_LOAD( ulong, bus_mem )==expected );
-      controller_fini( ctx );
-    }
+  ulong floors[] = { 96UL, 99UL, 100UL, 111UL, 10000UL, FD_FAILOVER_SLOT_NULL };
+  for( ulong replay=96UL; replay<112UL; replay++ ) for( ulong i=0UL; i<sizeof(floors)/sizeof(floors[0]); i++ ) {
+    fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
+    ctx->replay_slot = replay;
+    peer_says( ctx, FD_FAILOVER_ROLE_ACTIVE, floors[i], fd_failover_clock() );
+    FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, fd_failover_clock() )==FD_ADMINCTL_RESULT_SUCCESS );
+    step_controller( ctx, stem );
+    FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && ctx->empty_vote_after==replay );
+    FD_TEST( FD_LOAD( ulong, bus_mem )==replay && ctx->promote_floor==floors[i] && !pub_mcache[0].ctl );
+    deliver_adopt( ctx, ctx->adopt_expected_id, FD_VOTOR_ADOPT_SUCCESS, FD_FAILOVER_SLOT_NULL );
+    step_controller( ctx, stem );
+    FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH && ctx->peer_floor==floors[i] );
+    controller_fini( ctx );
   }
-  FD_LOG_NOTICE(( "pass: empty-history bounds cover every replay and known-floor window phase" ));
+  FD_LOG_NOTICE(( "pass: forced recovery preserves local replay bounds and retains peer floors for diagnostics" ));
 }
+
+#include "test_failover_unilateral.inc"
 
 int
 main( int     argc,
@@ -988,9 +979,11 @@ main( int     argc,
   test_ag_holder_recheck();
   test_promote_wait_replay();
   test_empty_history();
+  test_automatic_history();
   test_leader_after_promote();
   test_vote_stopped();
   test_empty_history_window();
+  test_unilateral_permissions();
 
 
   ulong footprint = scratch_footprint( &tiles[ 0 ] );

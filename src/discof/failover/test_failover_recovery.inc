@@ -50,12 +50,15 @@ test_recovery_guard_matrix( void ) {
     ctx->staked_seen_at=now;
     FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, force_on ? force : yes, now+14999999999L )==
              (force_on ? FD_ADMINCTL_RESULT_SUCCESS : FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN) );
-    if( !force_on ) FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, now+15000000000L )==FD_ADMINCTL_RESULT_SUCCESS );
+    if( !force_on ) FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, now+15000000000L )==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
     controller_fini( ctx );
   }
   fd_failover_tile_ctx_t * ctx=controller_init( FD_FAILOVER_ROLE_STANDBY );
   make_tower( &ctx->own_tower, 99UL );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_ADMINCTL_RESULT_SUCCESS );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
+  /* Independently retain the last-moment gossip defense for an unfenced
+     promotion state; the on-demand operator API refuses its admission. */
+  start_promotion( ctx, FD_FAILOVER_SOURCE_OWN, 0 );
   step_controller( ctx, stem );
   ctx->staked_seen_at=now+1L;
   adopt_answer( ctx, FD_TOWER_ADOPT_SUCCESS, 99UL );
