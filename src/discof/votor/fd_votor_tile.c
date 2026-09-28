@@ -380,7 +380,7 @@ doppelganger_check( fd_votor_tile_t * ctx,
   }
   FD_LOG_WARNING(( "failover: slot %lu has a vote from our identity that this machine never cast, another holder is voting, "
                    "we dropped %lu queued votes and refuse to vote or lead until the next identity switch, "
-                   "stop the other holder, then run `failover demote` here and `failover promote --yes` on the machine that should vote", slot, dropped_cnt ));
+                   "stop the other holder, then run `failover demote` here and `failover promote --force` on the machine that should vote", slot, dropped_cnt ));
 }
 
 static void
@@ -1275,7 +1275,7 @@ after_credit( fd_votor_tile_t *   ctx,
     fd_votor_hist_msg_t const * last = publish_hist( ctx, stem, 0 );
     ctx->identity_keyswitch->result = ctx->hist_out_idx!=ULONG_MAX ? stem->seqs[ ctx->hist_out_idx ] : 0UL;
     if( FD_UNLIKELY( last ) ) {
-      FD_LOG_NOTICE(( "failover: halted for an identity switch, dropped %lu queued votes as never sent and exported %lu voted slots on anchor %lu, the failover tile drains to sequence %lu",
+      FD_LOG_NOTICE(( "failover: halted for an identity switch, discarded %lu queued vote events at halt as never sent and exported %lu voted slots on anchor %lu, the failover tile drains to sequence %lu",
                       dropped_cnt, last->hist.rec_cnt, last->hist.anchor, ctx->identity_keyswitch->result ));
     }
     switch_identity( ctx );

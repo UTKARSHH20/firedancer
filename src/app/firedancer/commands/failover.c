@@ -83,7 +83,10 @@ role_name( uchar role ) {
 }
 
 static char const *
-action_name( uchar action ) {
+action_name( uchar action,
+             int   alpenglow ) {
+  if( alpenglow && action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT ) return "promote, waiting for the votor to adopt vote history";
+  if( alpenglow && action==FD_FAILOVER_ACTION_HANDOFF_WAIT_PEER   ) return "handoff, requesting the active's final vote history";
   return action<ACTION_NAME_CNT ? ACTION_NAMES[ action ] : "unknown";
 }
 
@@ -128,9 +131,8 @@ failover_control_fn( args_t *        args,
                       "machine cannot sign, or both machines may vote with the staked identity.\n"
                       "It also permits incomplete or empty vote history, which may lose earlier lockouts.\n" ));
     }
-    FD_LOG_STDOUT(( "Promotion tries eligible saved state, then the Tower vote account.\n"
-                    "Alpenglow uses empty history only with --force. Unusable or incomplete\n"
-                    "history otherwise refuses promotion.\n" ));
+    FD_LOG_STDOUT(( "Promotion tries eligible saved vote state, then account history where supported.\n"
+                    "Without --force, unusable or incomplete history refuses promotion.\n" ));
   }
   if( FD_UNLIKELY( !args->failover.yes ) ) {
     if( args->failover.cmd==(int)FD_ADMINCTL_FAILOVER_CMD_HANDOFF ) {
@@ -177,7 +179,7 @@ failover_control_fn( args_t *        args,
       }
       FD_LOG_STDOUT(( "%-22s accepted\n", CMD_NAMES[ args->failover.cmd ] ));
       FD_LOG_STDOUT(( "%-22s %s\n", "role:",   role_name  ( resp.role   ) ));
-      FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp.action ) ));
+      FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp.action, 0 ) ));
       FD_LOG_STDOUT(( "%-22s %s\n", "confirm with:", "failover status" ));
       break;
     case FD_FAILOVER_CONTROL_RESULT_BUSY:
@@ -206,11 +208,7 @@ failover_status_print( fd_adminctl_failover_status_resp_t const * resp ) {
 
   FD_LOG_STDOUT(( "%-22s %s\n", "failover:", "enabled" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "role:",   role_name  ( resp->role   ) ));
-  if( FD_UNLIKELY( resp->mode==FD_FAILOVER_MODE_ALPENGLOW && resp->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT ) ) {
-    FD_LOG_STDOUT(( "%-22s %s\n", "action:", "promote, waiting for the votor" ));
-  } else {
-    FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp->action ) ));
-  }
+  FD_LOG_STDOUT(( "%-22s %s\n", "action:", action_name( resp->action, resp->mode==FD_FAILOVER_MODE_ALPENGLOW ) ));
   FD_LOG_STDOUT(( "%-22s %s\n", "stuck:",  resp->stuck ? "yes, see the log" : "no" ));
   if( FD_UNLIKELY( resp->vote_stopped ) ) FD_LOG_STDOUT(( "%-22s %s\n", "voting:", "stopped, another machine voted with the staked identity, see the log" ));
   FD_LOG_STDOUT(( "%-22s %s\n", "link:",   resp->link_state<SESSION_NAME_CNT ? SESSION_NAMES[ resp->link_state ] : "unknown" ));
