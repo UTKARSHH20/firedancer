@@ -1039,6 +1039,7 @@ slot_text( ulong slot, char text[ 32 ] ) {
 /* The name of a refusal and what the operator can do about it. */
 static char const *
 control_refusal( ulong         result,
+                 ulong         mode,
                  char const ** hint ) {
   switch( result ) {
   case FD_FAILOVER_CONTROL_RESULT_BAD_ROLE:
@@ -1073,10 +1074,10 @@ control_refusal( ulong         result,
     return "STAKED_SEEN";
   case FD_FAILOVER_CONTROL_RESULT_NO_TOWER:
     *hint = "no eligible vote history, `failover promote --force` accepts incomplete or empty history after the peer is fenced";
-    return "NO_TOWER";
+    return mode==FD_FAILOVER_MODE_ALPENGLOW ? "NO_HISTORY" : "NO_TOWER";
   case FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER:
     *hint = "the active has no eligible final vote state to hand over and keeps the identity, its log explains whether no vote is known or history is missing, check its voting progress before retrying";
-    return "NO_FINAL_TOWER";
+    return mode==FD_FAILOVER_MODE_ALPENGLOW ? "NO_FINAL_HISTORY" : "NO_FINAL_TOWER";
   case FD_FAILOVER_CONTROL_RESULT_NO_HISTORY:
     *hint = "there is no vote history to adopt, `failover promote --force` starts from an empty history";
     return "NO_HISTORY";
@@ -1457,7 +1458,8 @@ step_controller( fd_failover_tile_ctx_t * ctx,
         return;
       }
       if( FD_UNLIKELY( !ctx->retry_logged ) ) {
-        FD_LOG_NOTICE(( "%s: the tower tile has not replayed every block the tower votes on, asking again as replay moves", ctx->promote_label ));
+        if( FD_UNLIKELY( ctx->mode==FD_FAILOVER_MODE_ALPENGLOW ) ) FD_LOG_NOTICE(( "%s: the votor is not ready to adopt the vote history, asking again as replay moves", ctx->promote_label ));
+        else                                                    FD_LOG_NOTICE(( "%s: the tower tile has not replayed every block the tower votes on, asking again as replay moves", ctx->promote_label ));
         ctx->retry_logged = 1;
       }
       ctx->adopt_retry      = 1;
@@ -1727,7 +1729,7 @@ handle_control( fd_failover_tile_ctx_t * ctx,
     int failed = result.result!=FD_ADMINCTL_RESULT_SUCCESS || ctx->role!=FD_FAILOVER_ROLE_ACTIVE;
     if( failed ) {
       char const * hint;
-      char const * name = control_refusal( result.result, &hint );
+      char const * name = control_refusal( result.result, ctx->mode, &hint );
       FD_LOG_WARNING(( "handoff %lu ended (%s), %s", result.handoff_id, name, hint ));
     }
     request_end( ctx, now, failed );
@@ -2158,7 +2160,7 @@ serve_bus_request( fd_failover_tile_ctx_t * ctx,
   ulong result = apply_control( ctx, &control, now );
   if( FD_UNLIKELY( result!=FD_ADMINCTL_RESULT_SUCCESS ) ) {
     char const * hint;
-    char const * name = control_refusal( result, &hint );
+    char const * name = control_refusal( result, ctx->mode, &hint );
     FD_LOG_WARNING(( "`failover %s` refused with %s, %s", cmd_name, name, hint ));
   }
   fd_adminctl_failover_control_resp_t answer = {

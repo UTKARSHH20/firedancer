@@ -821,7 +821,15 @@ test_events( void ) {
     { FD_FAILOVER_CONTROL_RESULT_NO_HISTORY,      "no_history"      },
     { 0x5001UL,                                   "refused"         },
   };
-  for( ulong i=0UL; i<sizeof(names)/sizeof(names[0]); i++ ) FD_TEST( !strcmp( failover_result_name( names[ i ].result ), names[ i ].name ) );
+  for( ulong i=0UL; i<sizeof(names)/sizeof(names[0]); i++ ) FD_TEST( !strcmp( failover_result_name( names[ i ].result, 0 ), names[ i ].name ) );
+
+  ctx.vote_tile = "votor";
+  idx = control( FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL );
+  nonce = ((fd_failover_bus_msg_t const *)out_mem)->nonce;
+  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER, &answer, sizeof(answer), 0 );
+  FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER );
+  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, "no_final_history", handoff ) );
+  ctx.vote_tile = "tower";
 
   /* Status shows no command, not even the one before it. */
   idx   = status_request();
