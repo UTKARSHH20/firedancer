@@ -58,6 +58,15 @@ ag_votor_advance_epoch( ag_votor_t *  self,
                         ulong         epoch_slot,
                         uchar const * bls_pubkey );
 
+/* Replaces the compressed BLS public key selector of the epoch starting
+   at epoch_slot, for when the keys we can sign with change after the
+   epoch advanced.  A NULL bls_pubkey disables voting in that epoch. */
+
+void
+ag_votor_set_bls_pubkey( ag_votor_t *  self,
+                         ulong         epoch_slot,
+                         uchar const * bls_pubkey );
+
 /* Algorithm 1, lines 9-25. Votor::handle_pool_event */
 
 void
