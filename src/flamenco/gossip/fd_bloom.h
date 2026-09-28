@@ -65,6 +65,18 @@ fd_bloom_insert8( fd_bloom_t *  bloom,
                   uchar const * ele,
                   uint          lanes );
 
+/* fd_bloom_insert16 is fd_bloom_insert8 of two element blocks, hashed
+   together so their chains interleave.  Sets the same bits as
+   fd_bloom_insert8( ele_a, lanes_a ) then fd_bloom_insert8( ele_b,
+   lanes_b ). */
+
+void
+fd_bloom_insert16( fd_bloom_t *  bloom,
+                   uchar const * ele_a,
+                   uint          lanes_a,
+                   uchar const * ele_b,
+                   uint          lanes_b );
+
 int
 fd_bloom_contains( fd_bloom_t *  bloom,
                    uchar const * key,
