@@ -1559,6 +1559,15 @@ test_input_link_indices( void ) {
   FD_TEST( ctx->in_kind[ callback_idx ]==IN_KIND_FAILOV );
   FD_TEST( ctx->in[ callback_idx ].chunk0==chunk && ctx->in[ callback_idx ].mtu==link->mtu );
 
+  /* A request without a bound must not authorize adoption or lower the prior bound. */
+  ctx->failover_hist_adopted = 0;
+  FD_STORE( ulong, link->dcache, ULONG_MAX );
+  during_frag( ctx, callback_idx, 1UL, 902UL, chunk, FD_VOTOR_ADOPT_EMPTY_SZ, 0UL );
+  after_frag( ctx, callback_idx, 1UL, 902UL, FD_VOTOR_ADOPT_EMPTY_SZ, 0UL, 0UL, stem );
+  reply = adopt_reply( 1UL, 902UL );
+  FD_TEST( reply->result==FD_VOTOR_ADOPT_ERR_INVALID && !ctx->failover_hist_adopted );
+  FD_TEST( ag_votor_vote_bound( ctx->votor )==9UL );
+
   fixture_delete( ctx );
   fd_wksp_delete_anonymous( wksp );
   FD_LOG_NOTICE(( "pass: production input initialization routes adoption past the unpolled signer link" ));
