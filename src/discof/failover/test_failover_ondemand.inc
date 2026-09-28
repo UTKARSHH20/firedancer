@@ -18,6 +18,8 @@ test_request_controls( void ) {
   ulong id = ctx->request_id;
   FD_TEST( id && ctx->channel->peer_addr==ctx->staked_addr && ctx->channel->dial_peer );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_HANDOFF_WAIT_PEER );
+  FD_TEST( !ctx->request_boot_id && !ctx->request_tx_log.count );
+  FD_TEST( strstr( request_wait( ctx ), "no peer authenticated, no handoff request sent" ) );
   fd_adminctl_failover_status_resp_t snap;
   status_snapshot( ctx, now, &snap );
   FD_TEST( snap.handoff_id==id && snap.handoff_result==FD_FAILOVER_HANDOFF_PENDING );
@@ -78,7 +80,7 @@ test_request_recovery( void ) {
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL, now )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_TEST( ctx->request_id==id && ctx->request_addr==ctx->staked_addr );
   /* A refused recovery command must not erase the resumable request. */
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, force, now )==FD_FAILOVER_CONTROL_RESULT_NO_TOWER );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_FAILOVER_CONTROL_RESULT_IN_PROGRESS );
   FD_TEST( ctx->request_id==id && ctx->action==FD_FAILOVER_ACTION_HANDOFF_WAIT_PEER );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, force|FD_ADMINCTL_FAILOVER_FLAG_YES, now )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_TEST( !ctx->request_id && ctx->request_result==FD_FAILOVER_HANDOFF_CANCELLED );
@@ -286,7 +288,7 @@ test_socket_handoffs( void ) {
   FD_TEST( !rmdir( dir ) );
   fd_wksp_delete_anonymous( wksp );
   free( mem );
-  FD_LOG_NOTICE(( "pass: gossip is idle; TLS handoffs reconnect after lost tower, ACK and result, then close" ));
+  FD_LOG_NOTICE(( "pass: gossip is idle, TLS handoffs reconnect after lost tower, ACK and result, then close" ));
 }
 
 static void

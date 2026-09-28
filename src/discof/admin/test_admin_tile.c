@@ -189,8 +189,15 @@ test_control_abi( void ) {
   bus_init();
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_CNT, 0UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
   FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, FD_EVENT_ADMIN_COMMAND_RESULT_UNKNOWN_COMMAND ) );
-  FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 4UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
+  FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 8UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
   FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, FD_EVENT_ADMIN_COMMAND_RESULT_UNKNOWN_COMMAND ) );
+
+  for( ulong cmd=FD_ADMINCTL_FAILOVER_CMD_HANDOFF; cmd<=FD_ADMINCTL_FAILOVER_CMD_DEMOTE; cmd++ ) {
+    FD_TEST( fd_adminctl_wait( ctx.adminctl, control( cmd, 4UL /* retired RECOVER flag */ ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
+    FD_TEST( fd_adminctl_wait( ctx.adminctl, control( cmd, FD_ADMINCTL_FAILOVER_FLAG_FORCE ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
+  }
+  FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 4UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
+  FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 6UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX && !pub_seq );
   fd_event_tl = NULL;
   FD_LOG_NOTICE(( "pass: failover command ABI checks" ));
@@ -368,6 +375,8 @@ test_status_abi( void ) {
   ctx.failover_enabled = 1;
   FD_TEST( fd_adminctl_wait( ctx.adminctl, status_request() )==FD_ADMINCTL_RESULT_UNSUPPORTED );
   FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_STATUS, FD_EVENT_ADMIN_COMMAND_RESULT_UNSUPPORTED ) );
+  FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 4UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
+  FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 6UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX && !pub_seq );
   fd_event_tl = NULL;
   FD_LOG_NOTICE(( "pass: failover status ABI checks" ));
@@ -621,6 +630,7 @@ test_events( void ) {
     { FD_FAILOVER_CONTROL_RESULT_IN_PROGRESS,     "in_progress"     },
     { FD_FAILOVER_CONTROL_RESULT_NOT_PAIRED,      "not_paired"      },
     { FD_FAILOVER_CONTROL_RESULT_PEER_UNREADY,    "peer_unready"    },
+    { FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED, "peer_unverified" },
     { FD_FAILOVER_CONTROL_RESULT_PEER_ACTIVE,     "peer_active"     },
     { FD_FAILOVER_CONTROL_RESULT_HANDOFF_PENDING, "handoff_pending" },
     { FD_FAILOVER_CONTROL_RESULT_TAKEN,           "taken"           },

@@ -74,9 +74,10 @@
 #define FD_FAILOVER_CONTROL_RESULT_HANDOFF_PENDING          (0x4008UL) /* the peer has not answered our handoff */
 #define FD_FAILOVER_CONTROL_RESULT_TAKEN                    (0x4009UL) /* the peer took our handoff and has not stood by or restarted since */
 #define FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN              (0x400AUL) /* gossip has a fresh contact info for the staked identity from another host */
-#define FD_FAILOVER_CONTROL_RESULT_NO_TOWER                 (0x400BUL) /* no tower to adopt, promote --yes adopts the vote account */
-#define FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER           (0x400CUL) /* handoff before the tower of our last vote is known, retry after the next vote */
+#define FD_FAILOVER_CONTROL_RESULT_NO_TOWER                 (0x400BUL) /* no eligible vote history; --force accepts incomplete or empty history */
+#define FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER           (0x400CUL) /* active has no eligible final vote state; see its local voting diagnostics */
 #define FD_FAILOVER_CONTROL_RESULT_NO_ACTIVE_ADDRESS        (0x400EUL) /* gossip has no address for the active */
+#define FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED          (0x400FUL) /* unilateral promote cannot verify the peer; explicit fencing required */
 
 struct fd_adminctl_add_auth_voter_v1 {
   ulong version; /* ==FD_ADMINCTL_ADD_AUTH_VOTER_PAYLOAD_VERSION */
@@ -125,8 +126,8 @@ typedef struct fd_adminctl_remove_all_auth_voters_v1 fd_adminctl_remove_all_auth
 #define FD_ADMINCTL_FAILOVER_CMD_PROMOTE (2UL)
 #define FD_ADMINCTL_FAILOVER_CMD_CNT     (3UL)
 
-#define FD_ADMINCTL_FAILOVER_FLAG_YES   (1UL) /* --yes, promote may start from the vote account */
-#define FD_ADMINCTL_FAILOVER_FLAG_FORCE (2UL) /* --force, promote skips the guards on the peer */
+#define FD_ADMINCTL_FAILOVER_FLAG_YES   (1UL) /* confirmation only; does not authorize peer or history overrides */
+#define FD_ADMINCTL_FAILOVER_FLAG_FORCE (2UL) /* --force, bypass peer guards and accept incomplete or empty vote history */
 
 struct fd_adminctl_failover_control_v1 {
   ulong version; /* ==FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION */
@@ -162,7 +163,7 @@ FD_STATIC_ASSERT( sizeof(fd_adminctl_failover_control_resp_t)==16UL, failover_co
 /* Where a promotion takes its tower from, best first */
 #define FD_FAILOVER_SOURCE_PEER         (0UL) /* the tower the peer's DEMOTED gave us */
 #define FD_FAILOVER_SOURCE_OWN          (1UL) /* our own final tower from this boot */
-#define FD_FAILOVER_SOURCE_VOTE_ACCOUNT (2UL) /* the vote account, promote --yes only */
+#define FD_FAILOVER_SOURCE_VOTE_ACCOUNT (2UL) /* automatic fallback to the vote account, or forced empty history */
 #define FD_FAILOVER_SOURCE_CNT          (3UL)
 
 /* How our last DEMOTED ended */

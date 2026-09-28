@@ -903,7 +903,7 @@ test_promotion_wait_replay( void ) {
      for the first one. */
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   ctx->replay_slot = FD_FAILOVER_SLOT_NULL;
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && !stem->seqs[ 0 ] );
   ctx->replay_slot = 100UL;
@@ -970,12 +970,14 @@ test_promotion_outcome_resent( void ) {
    the same handoff id from another peer boot is another handoff. */
 
 /* test_demote_sends_nothing: a demote drops the identity and tells the
-   peer nothing, paired or not.  Our final tower stays for a later
-   promote. */
+   peer nothing, paired or not. Either member may then recover, so a
+   later promotion consults the vote account with explicit consent. */
 static void
 test_demote_sends_nothing( void ) {
   for( int paired=0; paired<2; paired++ ) {
     fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
+    ctx->own_floor  = 99UL;
+    ctx->peer_floor = 98UL;
     if( paired ) pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
     make_tower( &ctx->cs, 99UL );
     FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_DEMOTE, 0UL, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
@@ -988,14 +990,13 @@ test_demote_sends_nothing( void ) {
     step_controller( ctx, stem );
     FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_IDLE && !ctx->stuck );
     FD_TEST( !ctx->pending_valid && !ctx->send_demoted && ctx->handoff_result==FD_FAILOVER_HANDOFF_NONE );
-    FD_TEST( ctx->own_tower.valid && ctx->own_tower.tip==99UL );
+    FD_TEST( !ctx->own_tower.valid && !ctx->peer_tower.valid );
+    FD_TEST( ctx->own_floor==99UL && ctx->peer_floor==98UL );
 
-    /* A plain promote adopts our own final tower, and a promotion that
-       succeeds drops it. */
-    FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
-    FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_OWN && ctx->adopt.tip==99UL );
+    FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
+    FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->adopt.valid && !ctx->adopt.sz );
     step_controller( ctx, stem );
-    adopt_answer( ctx, FD_TOWER_ADOPT_SUCCESS, 99UL );
+    acct_answer( ctx, 99UL, 99UL );
     step_controller( ctx, stem );
     switch_ok( ctx, 0UL );
     step_controller( ctx, stem );
@@ -1011,18 +1012,16 @@ test_demote_sends_nothing( void ) {
   demote_through( ctx, 0 );
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_IDLE && ctx->stuck );
   FD_TEST( !ctx->own_tower.valid && !ctx->pending_valid && !ctx->send_demoted );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, 1000L )==FD_FAILOVER_CONTROL_RESULT_NO_TOWER );
   controller_fini( ctx );
-  FD_LOG_NOTICE(( "pass: a demote sends nothing and keeps our final tower" ));
+  FD_LOG_NOTICE(( "pass: a demote sends nothing and falls back to the vote account after peer fencing" ));
 }
 
 /* stored_tower_ctx: a standby whose promotion on the peer's DEMOTED
-   ended at the deadline, so it keeps the peer's tower ending at 110. */
+   ended at the deadline. Its recovery cache is retired, its floor stays. */
 
-/* test_stored_tower: the peer's tower from a promotion that did not
-   finish is adopted by a later promote.  It survives a peer reboot, the
-   peer seen ACTIVE drops it, and once our root reaches its tip promote
-   skips it for the vote account. */
+/* test_stored_tower: after a declined handoff either member may recover
+   without reporting another tenure. Plain and forced promotion require
+   the vote account even if replay has not rooted past the old final. */
 
 /* test_promote_refusals: a DEMOTED is refused while we hold the
    identity, and without a STATUS from this session saying the peer
@@ -1089,6 +1088,7 @@ test_boot_binding( void ) {
   step_controller( ctx, stem );
   FD_TEST( !ctx->pending_valid && !ctx->send_demoted && ctx->action==FD_FAILOVER_ACTION_IDLE );
   FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_RESTARTED && !ctx->taken );
+  FD_TEST( !ctx->own_tower.valid && !ctx->peer_tower.valid );
   deliver_ack( ctx, handoff_id );
   FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_RESTARTED && !ctx->taken );
   controller_fini( ctx );
@@ -1147,9 +1147,11 @@ test_ack_during_switch( void ) {
    deadline. */
 static void
 test_adopt_unreplayed_retry( void ) {
+  uchar payload[ FD_FAILOVER_DEMOTED_PAYLOAD_MAX ];
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  make_tower( &ctx->peer_tower, 99UL );
-  start_promotion( ctx, FD_FAILOVER_SOURCE_PEER, 0 );
+  pair_demoter( ctx, 77UL, 1000L );
+  ulong payload_sz = demoted_payload( payload, 42UL, OUR_BOOT_ID, 99UL );
+  deliver( ctx, (ushort)FD_FAILOVER_MSG_DEMOTED, payload, payload_sz );
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
   ulong first = ctx->adopt_expected_id;
@@ -1174,10 +1176,9 @@ test_adopt_unreplayed_retry( void ) {
   controller_fini( ctx );
 
   /* The deadline still bounds the retries, and the peer hears why. */
-  uchar payload[ FD_FAILOVER_DEMOTED_PAYLOAD_MAX ];
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   pair_demoter( ctx, 77UL, 1000L );
-  ulong payload_sz = demoted_payload( payload, 42UL, OUR_BOOT_ID, 99UL );
+  payload_sz = demoted_payload( payload, 42UL, OUR_BOOT_ID, 99UL );
   deliver( ctx, (ushort)FD_FAILOVER_MSG_DEMOTED, payload, payload_sz );
   step_controller( ctx, stem );
   adopt_answer( ctx, FD_TOWER_ADOPT_ERR_UNREPLAYED, 90UL );
@@ -1185,7 +1186,8 @@ test_adopt_unreplayed_retry( void ) {
   ctx->replay_slot = 1000UL;
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_HANDOFF_WAIT_RESULT && ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->stuck );
-  FD_TEST( pending_rejected( ctx ).reason==FD_FAILOVER_REJECT_ADOPTION_FAILED && ctx->peer_tower.valid );
+  FD_TEST( pending_rejected( ctx ).reason==FD_FAILOVER_REJECT_ADOPTION_FAILED && !ctx->peer_tower.valid );
+  FD_TEST( ctx->adopt.valid && ctx->adopt.tip==99UL && ctx->peer_floor==99UL );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a tower short of replay is retried until the deadline" ));
 }
@@ -1210,11 +1212,13 @@ adopt_frag( fd_failover_tile_ctx_t * ctx,
 static void
 test_adopt_answer_id( void ) {
   static uchar res_mem[ sizeof(fd_tower_adopt_result_t) ] __attribute__((aligned(128)));
+  uchar payload[ FD_FAILOVER_DEMOTED_PAYLOAD_MAX ];
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   ctx->adopt_in_idx = 2UL;
   ctx->adopt_in_mem = (fd_wksp_t *)res_mem;
-  make_tower( &ctx->peer_tower, 99UL );
-  start_promotion( ctx, FD_FAILOVER_SOURCE_PEER, 0 );
+  pair_demoter( ctx, 77UL, 1000L );
+  ulong payload_sz = demoted_payload( payload, 42UL, OUR_BOOT_ID, 99UL );
+  deliver( ctx, (ushort)FD_FAILOVER_MSG_DEMOTED, payload, payload_sz );
   step_controller( ctx, stem );
   ulong first = ctx->adopt_expected_id;
   adopt_frag( ctx, first, FD_TOWER_ADOPT_ERR_UNREPLAYED, 90UL );
@@ -1310,8 +1314,14 @@ test_late_promote_ack( void ) {
   /* A refusal is DECLINED and stuck. */
   ctx->send_demoted = 1;
   ctx->handoff_id   = 5002UL;
+  make_tower( &ctx->peer_tower, 99UL );
+  make_tower( &ctx->own_tower, 99UL );
+  ctx->own_floor  = 99UL;
+  ctx->peer_floor = 98UL;
   deliver_rejected( ctx, 5002UL, (uchar)FD_FAILOVER_REJECT_BUSY );
   FD_TEST( !ctx->send_demoted && ctx->stuck && ctx->handoff_result==FD_FAILOVER_HANDOFF_DECLINED );
+  FD_TEST( !ctx->peer_tower.valid && !ctx->own_tower.valid && ctx->own_floor==99UL && ctx->peer_floor==98UL );
+  FD_TEST( promote_source( ctx )==FD_FAILOVER_SOURCE_VOTE_ACCOUNT );
   FD_TEST( !ctx->channel->metrics.wire_fatal_cnt );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a late acknowledgement is acted on and an unowed one is ignored" ));
@@ -1384,14 +1394,13 @@ test_bus_refusal_once( void ) {
 /* test_promote_guard: promote is refused while the peer holds or may
    hold the identity, and on the operator's word otherwise. */
 
-/* test_vote_account_yes: with no tower to adopt, promote needs --yes and
+/* test_vote_account_fallback: with no tower to adopt, promote falls back automatically and
    sends the tower tile an empty request for the vote account tower. */
 static void
-test_vote_account_yes( void ) {
+test_vote_account_fallback( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, 1000L )==FD_FAILOVER_CONTROL_RESULT_NO_TOWER );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->cs.valid );
   FD_TEST( ctx->last_vote_slot==FD_FAILOVER_SLOT_NULL );
   step_controller( ctx, stem );
@@ -1405,13 +1414,13 @@ test_vote_account_yes( void ) {
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_ACTIVE && !ctx->pending_valid );
   controller_fini( ctx );
 
-  /* A tower of our own is taken first, --yes or not. */
+  /* A tower of our own is taken first when it is eligible. */
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   make_tower( &ctx->own_tower, 99UL );
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_OWN && ctx->adopt.tip==99UL );
   controller_fini( ctx );
-  FD_LOG_NOTICE(( "pass: promote from the vote account needs --yes" ));
+  FD_LOG_NOTICE(( "pass: promote selects saved state before automatic vote-account fallback" ));
 }
 
 /* test_coverage_floor: the adopted tower has to reach the highest last
@@ -1423,7 +1432,7 @@ test_vote_account_yes( void ) {
 static void
 test_own_floor( void ) {
   long  later = 1000L+FD_FAILOVER_CHANNEL_SILENCE_NANOS;
-  ulong yes   = FD_ADMINCTL_FAILOVER_FLAG_YES;
+  ulong yes   = FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE;
 
   /* A standby's slot done is not ours to cover.  The vote transaction
      here does not parse, so no final tower is kept, but the vote counts
@@ -1452,20 +1461,14 @@ test_own_floor( void ) {
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && !ctx->own_tower.valid );
   make_tower( &ctx->peer_tower, 145UL );
   ctx->replay_slot = 200UL;
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, later )==FD_FAILOVER_CONTROL_RESULT_NO_TOWER );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, later )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && ctx->promote_floor==150UL );
   step_controller( ctx, stem );
   acct_answer( ctx, FD_FAILOVER_SLOT_NULL, 145UL );
   step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && ctx->adopt_retry );
-  ctx->replay_slot++;
-  step_controller( ctx, stem );
-  acct_answer( ctx, FD_FAILOVER_SLOT_NULL, 150UL );
-  step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH );
   controller_fini( ctx );
-  FD_LOG_NOTICE(( "pass: a promotion covers the votes we signed" ));
+  FD_LOG_NOTICE(( "pass: signed floors stay monotone and force explicitly overrides incomplete account coverage" ));
 }
 
 /* test_floor_wait_retry: the floor wait asks the tower tile again only
@@ -1480,7 +1483,7 @@ test_own_floor( void ) {
 static void
 test_promote_clock( void ) {
   long  step  = FD_FAILOVER_DEADLINE_SLOT_NANOS;
-  ulong yes   = FD_ADMINCTL_FAILOVER_FLAG_YES;
+  ulong yes   = FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE;
   uchar payload[ FD_FAILOVER_DEMOTED_PAYLOAD_MAX ];
 
   /* Replay stays short of the tower's tip and never reaches the slot
@@ -1512,9 +1515,9 @@ test_promote_clock( void ) {
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
   FD_TEST( ctx->promote_until>=before+(long)(FD_FAILOVER_FLOOR_SLACK_SLOTS+FD_FAILOVER_DEADLINE_SLOTS)*step );
-  acct_answer( ctx, FD_FAILOVER_SLOT_NULL, 140UL );
-  step_controller( ctx, stem );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && ctx->adopt_retry );
+  /* An outstanding request cannot be bypassed by issuing another one,
+     even with FORCE and even if its answer never arrives. */
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, 1000L )==FD_FAILOVER_CONTROL_RESULT_IN_PROGRESS );
   ctx->promote_until = fd_failover_clock();
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE && ctx->stuck );
@@ -1525,7 +1528,7 @@ test_promote_clock( void ) {
 
 /* test_promote_force: promote --force skips every check on the peer and
    gives up on our own handoff, but not a promotion or switch in flight.
-   The vote account still needs --yes and the floor still applies. */
+   Force also accepts incomplete or empty vote history. */
 
 /* test_force_cleared: a DEMOTED after a forced promote that failed runs
    without --force, so the peer saying ACTIVE still stops it. */
@@ -1645,6 +1648,8 @@ test_bus_status( void ) {
 #include "test_failover_ondemand.inc"
 #include "test_failover_recovery.inc"
 #include "test_failover_preserved.inc"
+#include "test_failover_unilateral.inc"
+#include "test_failover_auto.inc"
 
 int
 main( int argc, char ** argv ) {
@@ -1673,7 +1678,7 @@ main( int argc, char ** argv ) {
   test_late_promote_ack();
   test_bus_control_ordering();
   test_bus_refusal_once();
-  test_vote_account_yes();
+  test_vote_account_fallback();
   test_own_floor();
   test_promote_clock();
   test_switch_request();
@@ -1682,6 +1687,8 @@ main( int argc, char ** argv ) {
   test_ondemand();
   test_recovery();
   test_preserved();
+  test_unilateral_permissions();
+  test_automatic_recovery();
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();
   return 0;
