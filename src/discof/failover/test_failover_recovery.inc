@@ -54,11 +54,11 @@ test_recovery_guard_matrix( void ) {
     controller_fini( ctx );
   }
   fd_failover_tile_ctx_t * ctx=controller_init( FD_FAILOVER_ROLE_STANDBY );
-  make_tower( &ctx->own_tower, 99UL );
+  make_tower( &ctx->peer_tower, 99UL );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
   /* Independently retain the last-moment gossip defense for an unfenced
-     promotion state; the on-demand operator API refuses its admission. */
-  start_promotion( ctx, FD_FAILOVER_SOURCE_OWN, 0 );
+     promotion state, the on-demand operator API refuses its admission. */
+  start_promotion( ctx, FD_FAILOVER_SOURCE_PEER, 0 );
   step_controller( ctx, stem );
   ctx->staked_seen_at=now+1L;
   adopt_answer( ctx, FD_TOWER_ADOPT_SUCCESS, 99UL );
@@ -71,7 +71,6 @@ test_recovery_guard_matrix( void ) {
 static void
 test_recovery_sources( void ) {
   fd_failover_tile_ctx_t * ctx=controller_init( FD_FAILOVER_ROLE_STANDBY );
-  make_tower( &ctx->own_tower, 99UL );
   make_tower( &ctx->peer_tower, 100UL );
   ctx->own_floor=100UL;
   FD_TEST( promote_source( ctx )==FD_FAILOVER_SOURCE_PEER );
@@ -84,7 +83,7 @@ test_recovery_sources( void ) {
   FD_TEST( promote_source( ctx )==FD_FAILOVER_SOURCE_PEER );
   ctx->peer_tower.valid=0;
   ctx->root_slot=98UL;
-  FD_TEST( promote_source( ctx )==FD_FAILOVER_SOURCE_OWN );
+  FD_TEST( promote_source( ctx )==FD_FAILOVER_SOURCE_VOTE_ACCOUNT );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: sources below the signed floor or at the root are excluded" ));
 }
@@ -95,7 +94,7 @@ test_recovery( void ) {
   pair_demoter( ctx, 77UL, fd_failover_clock() );
   ctx->request_sent=1;
   ctx->channel->peer_hello.boot_id=78UL;
-  ctx->channel->metrics.paired_cnt++;
+  ctx->channel->generation++;
   sync_session( ctx );
   FD_TEST( !ctx->request_sent && ctx->peer_boot_id==78UL && ctx->request_boot_id==77UL );
   controller_fini( ctx );

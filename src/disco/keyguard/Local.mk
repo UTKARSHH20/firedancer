@@ -19,7 +19,10 @@ $(call run-unit-test,test_keyload)
 $(call make-proof,proof_authorize,fd_keyguard_proofs.c)
 
 $(call add-objs,fd_sign_tile,fd_disco)
-$(call make-unit-test,test_sign_tile,test_sign_tile,fd_disco fd_flamenco fd_tango fd_tls fd_ballet fd_util)
-$(call run-unit-test,test_sign_tile)
 endif
+endif
+
+ifdef FD_HAS_HOSTED
+$(call make-unit-test,test_sign_tile,test_sign_tile,fd_disco fd_discof fd_choreo fd_flamenco fd_waltz fd_tls fd_tango fd_ballet fd_util)
+$(call run-unit-test,test_sign_tile)
 endif

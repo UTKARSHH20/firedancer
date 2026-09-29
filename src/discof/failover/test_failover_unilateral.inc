@@ -8,7 +8,7 @@ test_unilateral_permissions( void ) {
     ctx->staked_seen_at = now-FD_FAILOVER_GOSSIP_FRESH_NANOS;
     fd_adminctl_failover_status_resp_t status;
     status_snapshot( ctx, now, &status );
-    int unverified = FD_FAILOVER_ON_DEMAND || !paired;
+    int unverified = 1;
     if( unverified ) FD_TEST( status.promote_result==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
     ulong want = unverified && !(flags & FD_ADMINCTL_FAILOVER_FLAG_FORCE) ? FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED : FD_ADMINCTL_RESULT_SUCCESS;
     FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, flags, now )==want );

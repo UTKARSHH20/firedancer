@@ -18,7 +18,7 @@ test_request_controls( void ) {
   ulong id = ctx->request_id;
   FD_TEST( id && ctx->channel->peer_addr==ctx->staked_addr && ctx->channel->dial_peer );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_HANDOFF_WAIT_PEER );
-  FD_TEST( !ctx->request_boot_id && !ctx->request_tx_log.count );
+  FD_TEST( !ctx->request_boot_id && !ctx->request_send_cnt );
   FD_TEST( strstr( request_wait( ctx ), "no peer authenticated, no handoff request sent" ) );
   fd_adminctl_failover_status_resp_t snap;
   status_snapshot( ctx, now, &snap );
@@ -42,7 +42,7 @@ test_request_controls( void ) {
   FD_TEST( ctx->pending_valid && ctx->pending_type==FD_FAILOVER_MSG_HANDOFF_RESULT );
   ctx->pending_valid = 0;
   ctx->close_after_send = 0;
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   request_from_peer( ctx, 43UL );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && ctx->handoff_id==43UL );
   step_controller( ctx, stem );
@@ -106,7 +106,7 @@ test_request_recovery( void ) {
   ctx->request_id = 42UL;
   ctx->request_until = now+FD_FAILOVER_CHANNEL_IDLE_NANOS;
   ctx->action = FD_FAILOVER_ACTION_HANDOFF_WAIT_RESULT;
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_DEMOTE, 0UL, now )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_TEST( !ctx->request_id && ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && !ctx->send_demoted );
   controller_fini( ctx );
@@ -156,7 +156,7 @@ test_request_binding( void ) {
 
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   demote_through( ctx, 1 );
   ctx->pending_valid = 0;
   unpair( ctx );
@@ -177,7 +177,7 @@ static void
 test_drain_clock( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   start_demotion( ctx, 1 );
   step_controller( ctx, stem );
   ctx->demote_until = fd_failover_clock()-1L;
@@ -229,8 +229,9 @@ test_socket_handoffs( void ) {
     peer_poll( a, now+(long)i*1000000000L, &busy );
     peer_poll( b, now+(long)i*1000000000L, &busy );
   }
-  FD_TEST( !a->channel->metrics.connection_attempt_cnt && !b->channel->metrics.connection_attempt_cnt );
-  FD_TEST( !a->channel->metrics.frames_sent && !b->channel->metrics.frames_sent );
+  FD_TEST( !a->channel->generation && !b->channel->generation );
+  FD_TEST( !fd_failover_channel_pending( a->channel ) && !fd_failover_channel_pending( b->channel ) );
+  FD_TEST( !a->channel->dial_peer && !b->channel->dial_peer );
   FD_TEST( !a->channel->peer_addr && !b->channel->peer_addr );
   stem_init();
   fd_failover_tile_ctx_t * nodes[2] = { a, b };
@@ -245,7 +246,7 @@ test_socket_handoffs( void ) {
     c->channel->backoff_min = c->channel->backoff_max = 1000000L;
     c->channel->backoff = 1000000L;
   }
-  make_tower( &a->cs, 99UL );
+  make_tower( &a->current_tower, 99UL );
   /* Alternate the requester over real TLS, including an immediate
      handoff back before the new active has produced a vote. */
   for( ulong round=0UL; round<4UL; round++ ) {

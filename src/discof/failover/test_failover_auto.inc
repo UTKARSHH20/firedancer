@@ -5,20 +5,20 @@ test_automatic_recovery( void ) {
   ulong errors[] = { FD_TOWER_ADOPT_ERR_DECODE, FD_TOWER_ADOPT_ERR_INVALID,
                      FD_TOWER_ADOPT_ERR_UNREPLAYED_ROOT, FD_TOWER_ADOPT_ERR_BLOCK_MISMATCH,
                      FD_TOWER_ADOPT_ERR_UNREPLAYED, FD_TOWER_ADOPT_SUCCESS };
-  for( int own=0; own<2; own++ ) for( ulong i=0UL; i<sizeof(errors)/sizeof(errors[0]); i++ ) {
+  for( ulong i=0UL; i<sizeof(errors)/sizeof(errors[0]); i++ ) {
     fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
     ctx->adopt_in_idx = 2UL;
     ctx->adopt_in_mem = (fd_wksp_t *)res_mem;
-    make_tower( own ? &ctx->own_tower : &ctx->peer_tower, 99UL );
+    make_tower( &ctx->peer_tower, 99UL );
     FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, fd_failover_clock() )==FD_ADMINCTL_RESULT_SUCCESS );
-    FD_TEST( ctx->promote_source==(own ? FD_FAILOVER_SOURCE_OWN : FD_FAILOVER_SOURCE_PEER) );
+    FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_PEER );
     step_controller( ctx, stem );
     ulong first = ctx->adopt_expected_id;
     adopt_answer( ctx, errors[i], 98UL ); /* SUCCESS with a short prefix also falls back */
     step_controller( ctx, stem );
     FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && ctx->promote_force && !ctx->promote_empty );
     FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->adopt.sz );
-    FD_TEST( !(own ? ctx->own_tower.valid : ctx->peer_tower.valid) );
+    FD_TEST( !ctx->peer_tower.valid );
     step_controller( ctx, stem );
     ulong second = ctx->adopt_expected_id;
     FD_TEST( second!=first && !pub_mcache[1].sz && !pub_mcache[1].ctl );
@@ -33,7 +33,7 @@ test_automatic_recovery( void ) {
 
   /* No usable vote account means refusal without FORCE, including
      unreplayed account blocks.  An operator can retry after replay
-     catches up; no local request remains outstanding at this point. */
+     catches up, no local request remains outstanding at this point. */
   for( ulong i=0UL; i<sizeof(errors)/sizeof(errors[0])-1UL; i++ ) {
     fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
     start_promotion( ctx, FD_FAILOVER_SOURCE_VOTE_ACCOUNT, 0 );
@@ -48,11 +48,11 @@ test_automatic_recovery( void ) {
   /* A saved tip ahead of replay is not currently adoptable.  Falling
      back before publishing sends only the account request. */
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  make_tower( &ctx->own_tower, 10000UL );
+  make_tower( &ctx->peer_tower, 10000UL );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, fd_failover_clock() )==FD_ADMINCTL_RESULT_SUCCESS );
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && !stem->seqs[ 0 ] );
-  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->own_tower.valid );
+  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT );
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && stem->seqs[ 0 ]==1UL && !pub_mcache[0].ctl );
   controller_fini( ctx );

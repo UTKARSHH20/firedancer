@@ -11,8 +11,8 @@
 #include "../../flamenco/leaders/fd_leaders_base.h"
 #include "../../ballet/siphash13/fd_siphash13.h"
 #include "../../util/net/fd_net_headers.h"
-#include "../../util/net/fd_ip6.h"
 #include "../../disco/net/fd_net_tile.h"
+#include <linux/futex.h>
 #include "generated/fd_gossvf_tile_seccomp.h"
 
 #define DEBUG_PEERS (0)
@@ -570,15 +570,7 @@ check_duplicate_instance( fd_gossvf_tile_ctx_t *      ctx,
     if( FD_LIKELY( ctx->instance_creation_wallclock_nanos>=FD_MICRO_TO_NANOSEC( value->contact_info->outset ) ) ) continue;
     if( FD_LIKELY( memcmp( ctx->identity_pubkey->uc, value->origin, 32UL ) ) ) continue;
 
-    FD_BASE58_ENCODE_32_BYTES( ctx->identity_pubkey->uc, identity );
-    fd_gossip_socket_t const * socket = &value->contact_info->sockets[ FD_GOSSIP_CONTACT_INFO_SOCKET_GOSSIP ];
-    fd_ip6_addr_t advertised_addr = {0};
-    if( socket->is_ipv6 ) fd_memcpy( advertised_addr.addr, socket->ip6, 16UL );
-    else                 fd_ip6_addr_ip4_mapped( advertised_addr.addr, socket->ip4 );
-    FD_IP6_ADDR_CSTR( advertised, &advertised_addr );
-    FD_LOG_ERR(( "duplicate instance contact info for our current identity `%s`: our identity instance timestamp %ldns, received %ldns, advertised gossip %s:%hu, received via " FD_IP4_ADDR_FMT ":%hu, stopping this validator. The record may be relayed, compare this key with the identity and standby keys configured on both machines and check for another process using it",
-                 identity, ctx->instance_creation_wallclock_nanos, FD_MICRO_TO_NANOSEC( value->contact_info->outset ),
-                 advertised, fd_ushort_bswap( socket->port ), FD_IP4_ADDR_FMT_ARGS( ctx->peer.addr ), fd_ushort_bswap( ctx->peer.port ) ));
+    FD_LOG_ERR(( "duplicate running instances of the same validator node, our timestamp: %ldns their timestamp: %ldns", ctx->instance_creation_wallclock_nanos, FD_MICRO_TO_NANOSEC( value->contact_info->outset ) ));
   }
 }
 
@@ -961,26 +953,13 @@ handle_net( fd_gossvf_tile_ctx_t * ctx,
 
   uchar * dst = fd_chunk_to_laddr( ctx->out->mem, ctx->out->chunk );
 
-  ulong msg_copy_sz;
-  switch( message->tag ) {
-    case FD_GOSSIP_MESSAGE_PULL_RESPONSE:
-      msg_copy_sz = (ulong)((uchar const *)message->pull_response->values-(uchar const *)message)+message->pull_response->values_len*sizeof(fd_gossip_value_t);
-      break;
-    case FD_GOSSIP_MESSAGE_PUSH:
-      msg_copy_sz = (ulong)((uchar const *)message->push->values-(uchar const *)message)+message->push->values_len*sizeof(fd_gossip_value_t);
-      break;
-    case FD_GOSSIP_MESSAGE_PULL_REQUEST: msg_copy_sz = (ulong)((uchar const *)(message->pull_request+1)-(uchar const *)message); break;
-    case FD_GOSSIP_MESSAGE_PRUNE:        msg_copy_sz = (ulong)((uchar const *)(message->prune+1)       -(uchar const *)message); break;
-    case FD_GOSSIP_MESSAGE_PING:         msg_copy_sz = (ulong)((uchar const *)(message->ping+1)        -(uchar const *)message); break;
-    case FD_GOSSIP_MESSAGE_PONG:         msg_copy_sz = (ulong)((uchar const *)(message->pong+1)        -(uchar const *)message); break;
-    default:                             msg_copy_sz = sizeof(fd_gossip_message_t); break;
-  }
-  fd_memcpy( dst, message, msg_copy_sz );
-  fd_memcpy( dst+sizeof(fd_gossip_message_t), failed, FD_GOSSIP_MESSAGE_MAX_CRDS );
-  fd_memcpy( dst+sizeof(fd_gossip_message_t)+FD_GOSSIP_MESSAGE_MAX_CRDS, payload, payload_sz );
+  ulong copy_sz = fd_gossip_message_used_sz( message );
+  fd_memcpy( dst, message, copy_sz );
+  fd_memcpy( dst+copy_sz, failed, FD_GOSSIP_MESSAGE_MAX_CRDS );
+  fd_memcpy( dst+copy_sz+FD_GOSSIP_MESSAGE_MAX_CRDS, payload, payload_sz );
 
   ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
-  ulong out_sz = sizeof(fd_gossip_message_t)+FD_GOSSIP_MESSAGE_MAX_CRDS+payload_sz;
+  ulong out_sz = copy_sz+FD_GOSSIP_MESSAGE_MAX_CRDS+payload_sz;
   fd_stem_publish( stem, 0UL, fd_gossvf_sig( ctx->peer.addr, ctx->peer.port, 0 ), ctx->out->chunk, out_sz, 0UL, tsorig, tspub );
   ctx->out->chunk = fd_dcache_compact_next( ctx->out->chunk, out_sz, ctx->out->chunk0, ctx->out->wmark );
 

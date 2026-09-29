@@ -289,6 +289,7 @@ fd_topo_initialize( config_t * config ) {
   int leader_enabled    = !!config->firedancer.layout.enable_block_production;
   int rserve_enabled    = config->tiles.rserve.enabled;
   int alpenglow_enabled = config->firedancer.development.alpenglow;
+  int efficient_mode    = !strcmp( config->firedancer.layout.mode, "efficient" );
   int failover_enabled  = config->firedancer.failover.enabled;
 
   char const * repair = alpenglow_enabled ? "rotor" : "repair";
@@ -430,7 +431,7 @@ fd_topo_initialize( config_t * config ) {
   if( FD_UNLIKELY( failover_enabled ) ) {
     fd_topob_wksp( topo, "admin_failov" );
     fd_topob_wksp( topo, "failov_admin" );
-    if( !alpenglow_enabled ) fd_topob_wksp( topo, "failov_tower" );
+    if( !alpenglow_enabled ) fd_topob_wksp( topo, "adopt_tower" );
   }
 
   if( FD_LIKELY( snapshots_enabled ) ) {
@@ -526,8 +527,8 @@ fd_topo_initialize( config_t * config ) {
     /**/               fd_topob_link( topo, "admin_failov",  "admin_failov",  32UL,                                     FD_FAILOVER_BUS_MTU,           1UL );
     /**/               fd_topob_link( topo, "failov_admin",  "failov_admin",  32UL,                                     FD_FAILOVER_BUS_MTU,           1UL );
     if( !alpenglow_enabled ) {
-    /**/               fd_topob_link( topo, "failov_tower",  "failov_tower",  32UL,                                     FD_FAILOVER_TOWER_STATE_MAX,   1UL );
-    /**/               fd_topob_link( topo, "tower_failov",  "failov_tower",  32UL,                                     sizeof(fd_tower_adopt_result_t), 1UL );
+    /**/               fd_topob_link( topo, "adopt_tower",   "adopt_tower",   32UL,                                     FD_FAILOVER_TOWER_STATE_MAX,   1UL );
+    /**/               fd_topob_link( topo, "tower_adopt",   "adopt_tower",   32UL,                                     sizeof(fd_tower_adopt_result_t), 1UL );
     }
   }
   if( leader_enabled ) {
@@ -559,7 +560,7 @@ fd_topo_initialize( config_t * config ) {
 
   if( FD_UNLIKELY( failover_enabled ) ) {
     /**/               fd_topob_link( topo, "failov_sign",   "failov_sign",   128UL,                                    FD_KEYGUARD_MEMBER_CERT_MSG_SZ, 1UL );
-    /**/               fd_topob_link( topo, "sign_failov",   "sign_failov",   128UL,                                    sizeof(fd_ed25519_sig_t),       1UL );
+    /**/               fd_topob_link( topo, "sign_failov",   "sign_failov",   128UL,                                    sizeof(fd_ed25519_sig_t),      1UL );
   }
 
   FOR(shred_tile_cnt)  fd_topob_link( topo, "shred_out",     "shred_out",     shred_depth,                              sizeof(fd_shred_message_t),    FD_SHRED_STEM_BURST );
@@ -595,6 +596,8 @@ fd_topo_initialize( config_t * config ) {
                    cpu_idx, cpus->cpu_cnt ));
     tile_to_cpu[ i ] = fd_ulong_if( parsed_tile_to_cpu[ i ]==USHORT_MAX, ULONG_MAX, (ulong)parsed_tile_to_cpu[ i ] );
   }
+
+  if( FD_UNLIKELY( efficient_mode ) ) fd_topob_sleep( topo, "metric_in", tile_to_cpu[ topo->tile_cnt ] );
 
   int xsk_core_dump = config->development.core_dump_level >= FD_TOPO_CORE_DUMP_LEVEL_REGULAR ? 1 : 0;
   fd_topos_net_tiles( topo, net_tile_cnt, &config->net, config->tiles.netlink.max_routes, config->tiles.netlink.max_peer_routes, config->tiles.netlink.max_neighbors, xsk_core_dump, tile_to_cpu );
@@ -786,7 +789,7 @@ fd_topo_initialize( config_t * config ) {
   if( FD_UNLIKELY( failover_enabled ) ) {
     /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "gossip_out",    0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED ); /* contact infos for the peer's address, an overrun only delays it */
     /* Command bus between the admin tile and the failover tile.  The admin
-       side reads the answers unreliably so it cannot backpressure the
+       side reads the responses unreliably so it cannot backpressure the
        failover tile. */
     /**/               fd_topob_tile_out(   topo, "admin",   0UL,                       "admin_failov",  0UL                                                );
     /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "admin_failov",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
@@ -795,11 +798,11 @@ fd_topo_initialize( config_t * config ) {
   }
   if( !alpenglow_enabled && failover_enabled ) {
     /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "tower_out",     0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
-    /* Adoption is a request and an answer, so both ends are reliable.
+    /* Adoption is a request and a response, so both ends are reliable.
        The tower side is wired after its own output below, which has to
        stay the tower tile's first output link. */
-    /**/               fd_topob_tile_out(   topo, "failov",  0UL,                       "failov_tower",  0UL                                                );
-    /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "tower_failov",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    /**/               fd_topob_tile_out(   topo, "failov",  0UL,                       "adopt_tower",   0UL                                                );
+    /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "tower_adopt",   0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   }
 
   FOR(execrp_tile_cnt) fd_topob_tile_in (   topo, "execrp",  i,            "metric_in", "replay_execrp", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
@@ -814,8 +817,8 @@ fd_topo_initialize( config_t * config ) {
   FOR(shred_tile_cnt)  fd_topob_tile_in(    topo, "tower",   0UL,          "metric_in", "shred_out",     i,            FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   /**/                 fd_topob_tile_out(   topo, "tower",   0UL,                       "tower_out",     0UL                                                );
   if( FD_UNLIKELY( failover_enabled ) ) {
-    /**/               fd_topob_tile_in (   topo, "tower",   0UL,          "metric_in", "failov_tower",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
-    /**/               fd_topob_tile_out(   topo, "tower",   0UL,                       "tower_failov",  0UL                                                );
+    /**/               fd_topob_tile_in (   topo, "tower",   0UL,          "metric_in", "adopt_tower",   0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
+    /**/               fd_topob_tile_out(   topo, "tower",   0UL,                       "tower_adopt",   0UL                                                );
   }
   }
 
@@ -955,7 +958,7 @@ fd_topo_initialize( config_t * config ) {
   /*                                        topo, tile_name, tile_kind_id, fseq_wksp,   link_name,      link_kind_id, reliable,            polled */
   /**/                 fd_topob_tile_in (   topo, "sign",    0UL,          "metric_in", "gossip_sign",  0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_out(   topo, "gossip",  0UL,                       "gossip_sign",  0UL                                                  );
-  /**/                 fd_topob_tile_in (   topo, "gossip",  0UL,          "metric_in", "sign_gossip",  0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+  /**/                 fd_topob_tile_in (   topo, "gossip",  0UL,          "metric_in", "sign_gossip",  0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
   /**/                 fd_topob_tile_out(   topo, "sign",    0UL,                       "sign_gossip",  0UL                                                  );
 
   for( ulong i=0UL; i<shred_tile_cnt; i++ ) {
@@ -983,10 +986,10 @@ fd_topo_initialize( config_t * config ) {
   /**/                 fd_topob_tile_out(   topo, "sign",    0UL,                       "sign_txsend",  0UL                                                  );
 
   if( FD_UNLIKELY( failover_enabled ) ) {
-    /**/               fd_topob_tile_in (   topo, "sign",    0UL,          "metric_in", "failov_sign",  0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
-    /**/               fd_topob_tile_out(   topo, "failov",  0UL,                       "failov_sign",  0UL                                                  );
-    /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "sign_failov",  0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
-    /**/               fd_topob_tile_out(   topo, "sign",    0UL,                       "sign_failov",  0UL                                                  );
+    /**/               fd_topob_tile_in (   topo, "sign",    0UL,          "metric_in", "failov_sign",   0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED   );
+    /**/               fd_topob_tile_out(   topo, "failov",  0UL,                       "failov_sign",   0UL                                                  );
+    /**/               fd_topob_tile_in (   topo, "failov",  0UL,          "metric_in", "sign_failov",   0UL,          FD_TOPOB_UNRELIABLE, FD_TOPOB_UNPOLLED );
+    /**/               fd_topob_tile_out(   topo, "sign",    0UL,                       "sign_failov",   0UL                                                  );
   }
 
   if( FD_UNLIKELY( rpc_enabled ) ) {
@@ -1398,6 +1401,8 @@ fd_topo_initialize( config_t * config ) {
 
   fd_topob_waker( topo );
 
+  fd_topob_sleep_finish( topo );
+
   for( ulong i=0UL; i<topo->tile_cnt; i++ ) {
     fd_topo_configure_tile( &topo->tiles[ i ], config );
     if( FD_UNLIKELY( !strcmp( topo->tiles[ i ].name, "gui" ) ) ) topo->tiles[ i ].gui.tile_cnt = topo->tile_cnt;
@@ -1692,6 +1697,7 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     }
 
     tile->replay.max_live_slots = config->firedancer.runtime.max_live_slots;
+    tile->replay.genesis_max_message_size = config->firedancer.development.genesis.max_file_size_mib << 20;
     tile->replay.full_snapshot_interval_blocks        = config->firedancer.snapshots.full_snapshot_interval_blocks;
     tile->replay.incremental_snapshot_interval_blocks = config->firedancer.snapshots.incremental_snapshot_interval_blocks;
 
@@ -1760,8 +1766,8 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     fd_cstr_ncpy( tile->tower.identity_key, identity_key_path, sizeof(tile->tower.identity_key) );
     fd_cstr_ncpy( tile->tower.vote_account, config->paths.vote_account, sizeof(tile->tower.vote_account) );
     fd_cstr_ncpy( tile->tower.base_path, config->paths.base, sizeof(tile->tower.base_path) );
-    tile->tower.failover_enabled = config->firedancer.failover.enabled;
-    fd_cstr_ncpy( tile->tower.failover_staked_identity_path, config->paths.identity_key, sizeof(tile->tower.failover_staked_identity_path) );
+    tile->tower.adoption_required = config->firedancer.failover.enabled;
+    fd_cstr_ncpy( tile->tower.voting_identity_path, config->paths.identity_key, sizeof(tile->tower.voting_identity_path) );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "accdb" ) ) ) {
 
@@ -1924,6 +1930,8 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     fd_cstr_ncpy( tile->diag.log_path,       config->log.path,        sizeof(tile->diag.log_path)      );
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "waker" ) ) ) {
+
+  } else if( FD_UNLIKELY( !strcmp( tile->name, "mwaitx" ) ) ) {
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "gui" ) ) ) {
 

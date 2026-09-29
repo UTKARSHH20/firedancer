@@ -22,7 +22,7 @@ test_roundtrip( void ) {
   uchar payload[ 70 ];
   for( ulong i=0UL; i<70UL; i++ ) payload[ i ] = (uchar)i;
 
-  ulong sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_STATUS, payload, 70UL );
+  ulong sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_HANDOFF_REQUEST, payload, 70UL );
   FD_TEST( sz==FD_FAILOVER_FRAME_HDR_SZ+70UL );
 
   ushort        type;
@@ -30,7 +30,7 @@ test_roundtrip( void ) {
   ulong         out_sz;
   ulong         frame_sz;
   FD_TEST( fd_failover_wire_decode( &b, frame, sz, &type, &out, &out_sz, &frame_sz )==FD_FAILOVER_WIRE_SUCCESS );
-  FD_TEST( type==(ushort)FD_FAILOVER_MSG_STATUS );
+  FD_TEST( type==(ushort)FD_FAILOVER_MSG_HANDOFF_REQUEST );
   FD_TEST( out_sz==70UL );
   FD_TEST( frame_sz==sz );
   FD_TEST( fd_memeq( out, payload, 70UL ) );
@@ -70,7 +70,7 @@ test_bounds( void ) {
   paired_sessions( &a, &b );
 
   uchar payload[ 8 ] = { 0 };
-  ulong sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_STATUS, payload, 8UL );
+  ulong sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_HANDOFF_REQUEST, payload, 8UL );
 
   ushort        type;
   uchar const * out;
@@ -82,7 +82,7 @@ test_bounds( void ) {
   FD_TEST( fd_failover_wire_decode( &b, frame, sz-1UL, &type, &out, &out_sz, &frame_sz )==FD_FAILOVER_WIRE_ERR_AGAIN );
 
   /* Oversize payload is unencodable. */
-  FD_TEST( fd_failover_wire_encode( &a, big, (ushort)FD_FAILOVER_MSG_STATUS, big, FD_FAILOVER_PAYLOAD_MAX+1UL )==0UL );
+  FD_TEST( fd_failover_wire_encode( &a, big, (ushort)FD_FAILOVER_MSG_HANDOFF_REQUEST, big, FD_FAILOVER_PAYLOAD_MAX+1UL )==0UL );
 
   /* An oversize or undersize declared length should fatal. */
   fd_memcpy( big, frame, sz );
@@ -103,10 +103,10 @@ test_bounds( void ) {
   FD_TEST( fd_failover_wire_decode( &b, big, sz, &type, &out, &out_sz, &frame_sz )==FD_FAILOVER_WIRE_ERR_VERSION );
 
   a.tx_seq = ULONG_MAX;
-  FD_TEST( !fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_STATUS, payload, sizeof(payload) ) );
+  FD_TEST( !fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_HANDOFF_REQUEST, payload, sizeof(payload) ) );
 
   paired_sessions( &a, &b );
-  sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_STATUS, payload, sizeof(payload) );
+  sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_HANDOFF_REQUEST, payload, sizeof(payload) );
   b.rx_seq = ULONG_MAX;
   FD_TEST( fd_failover_wire_decode( &b, frame, sz, &type, &out, &out_sz, &frame_sz )==FD_FAILOVER_WIRE_ERR_SEQ );
 
@@ -122,7 +122,7 @@ test_unknown_type( void ) {
   FD_TEST( !fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_RESERVED, payload, sizeof(payload) ) );
   FD_TEST( !a.tx_seq );
 
-  ulong sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_STATUS, payload, sizeof(payload) );
+  ulong sz = fd_failover_wire_encode( &a, frame, (ushort)FD_FAILOVER_MSG_HANDOFF_REQUEST, payload, sizeof(payload) );
   fd_failover_frame_hdr_t hdr;
   fd_memcpy( &hdr, frame, sizeof(hdr) );
   hdr.type = (ushort)FD_FAILOVER_MSG_RESERVED;

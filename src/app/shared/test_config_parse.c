@@ -174,12 +174,10 @@ main( int     argc,
   config->firedancer.runtime.program_cache_size_mib            = 32UL;
   config->tiles.repair.slot_max                                   = 1UL;
   config->tiles.rotor.slot_max                                    = 1UL;
+  strcpy( config->firedancer.layout.mode, "performance" );
 
   FD_TEST(  genesis_max_file_size_is_valid( config, 4055UL ) );
   FD_TEST( !genesis_max_file_size_is_valid( config, 4056UL ) );
-
-  /* Failover needs a nonzero port, no Alpenglow, a junk key apart
-     from the staked identity key and a peer address without a port. */
 
   static char const identity[] = "/keys/identity.json";
   static char const junk[]     = "/keys/junk.json";

@@ -144,6 +144,7 @@ struct fd_topo_tile {
 
   ulong cpu_idx;                /* The CPU index to pin the tile on.  A value of ULONG_MAX or more indicates the tile should be floating and not pinned to a core. */
   int   floats;                 /* Scheduled by the kernel over the CPUs of the floating tiles on its NUMA node, never a pinned tile's CPU, instead of pinned to cpu_idx (efficient mode).  cpu_idx still places memory and isolation, and is the fallback when no such CPU remains. */
+  int   sleep_eventfd;          /* Parks in epoll on its own fds and is woken through the eventfd FD_SLEEP_EVENTFD( id ), not FUTEX_WAKE (efficient mode only) */
 
   ulong waker_client_idx;       /* Client slot in the fixed inherited fd range (inner epoll fd FD_WAKER_INNER_FD( idx )), or ULONG_MAX if not a waker client */
   ulong waker_fseq_obj_id;      /* fseq object holding the tile's waker readiness word or ULONG_MAX */
@@ -253,14 +254,14 @@ struct fd_topo_tile {
     } admin;
 
     struct {
-      char   identity_key_path[ PATH_MAX ]; /* this machine's junk key */
-      char   staked_key_path[ PATH_MAX ];   /* we read only its public half */
+      char   identity_key_path[ PATH_MAX ];   /* this machine's junk key */
+      char   staked_key_path[ PATH_MAX ];     /* we read only its public half */
       char   vote_account_path[ PATH_MAX ];
       ushort port;
       char   peer_address[ FD_FQDN_BUF_MAX ]; /* empty to find the active through gossip */
 
       char          gossip_host[ FD_FQDN_BUF_MAX ];
-      fd_ip4_port_t gossip_addr;                    /* our own gossip socket, gossip_host overrides the address */
+      fd_ip4_port_t gossip_addr; /* our own gossip socket, gossip_host overrides the address */
     } failov;
 
 #define FD_TOPO_GOSSIP_ENTRYPOINTS_MAX 16UL
@@ -526,6 +527,7 @@ struct fd_topo_tile {
       ulong heap_size_gib;
       ulong sched_depth;
       ulong max_live_slots;
+      ulong genesis_max_message_size;
       ulong full_snapshot_interval_blocks;
       ulong incremental_snapshot_interval_blocks;
 
@@ -667,8 +669,8 @@ struct fd_topo_tile {
       char  vote_account[ PATH_MAX ];
       char  base_path[PATH_MAX];
       ulong max_shreds_per_block;
-      int   failover_enabled;
-      char  failover_staked_identity_path[ PATH_MAX ];
+      int   adoption_required;
+      char  voting_identity_path[ PATH_MAX ];
     } tower;
 
     struct {

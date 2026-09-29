@@ -216,8 +216,7 @@ controller_fini( fd_failover_tile_ctx_t * ctx ) {
   fd_failover_channel_fini( ctx->channel );
 }
 
-/* Marks the session paired with a peer boot and gives us a fresh STATUS
-   from it with peer_role, as if our own first STATUS went out too. */
+/* Authenticate a peer boot and role for this session. */
 static void
 pair( fd_failover_tile_ctx_t * ctx,
       ulong                    boot_id,
@@ -321,7 +320,7 @@ adopt_answer( fd_failover_tile_ctx_t * ctx,
   ctx->adopt_result_fresh = 1;
 }
 
-/* The tower tile's answer to an empty request, vote_slot is what is left
+/* The tower tile's response to an empty request, vote_slot is what is left
    above our root and acct_vote_slot the account's own last vote. */
 static void
 acct_answer( fd_failover_tile_ctx_t * ctx,
@@ -374,7 +373,7 @@ control( fd_failover_tile_ctx_t * ctx,
          ulong                    cmd,
          ulong                    flags,
          long                     now ) {
-  fd_adminctl_failover_control_t req = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, .cmd=cmd, .flags=flags };
+  fd_adminctl_failover_req_t req = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, .cmd=cmd, .flags=flags };
   return apply_control( ctx, &req, now );
 }
 
@@ -492,10 +491,10 @@ test_slot_done_bookkeeping( void ) {
   done.vote_slot    = 101UL;
   done.has_vote_txn = 0;
   consume_slot_done( ctx, &done );
-  FD_TEST( ctx->last_vote_slot==FD_FAILOVER_SLOT_NULL && !ctx->cs.valid );
+  FD_TEST( ctx->last_vote_slot==FD_FAILOVER_SLOT_NULL && !ctx->current_tower.valid );
   done.has_vote_txn = 1;
   consume_slot_done( ctx, &done );
-  FD_TEST( ctx->last_vote_slot==101UL && !ctx->cs.valid );
+  FD_TEST( ctx->last_vote_slot==101UL && !ctx->current_tower.valid );
 
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: slot bookkeeping and the local status view" ));
@@ -542,30 +541,30 @@ test_final_tower( void ) {
   /* A frag skipped before this vote is superseded by it. */
   ctx->tower_gap = 1;
   consume_slot_done( ctx, &done );
-  FD_TEST( ctx->cs.valid && ctx->cs.tip==31UL && ctx->last_vote_slot==31UL );
+  FD_TEST( ctx->current_tower.valid && ctx->current_tower.tip==31UL && ctx->last_vote_slot==31UL );
   FD_TEST( !ctx->tower_gap );
 
   /* A malformed vote transaction leaves the previous tower in place. */
-  ulong good_sz = ctx->cs.sz;
+  ulong good_sz = ctx->current_tower.sz;
   done.vote_txn_sz = 3UL;
   consume_slot_done( ctx, &done );
-  FD_TEST( ctx->cs.valid && ctx->cs.sz==good_sz );
+  FD_TEST( ctx->current_tower.valid && ctx->current_tower.sz==good_sz );
   done.vote_txn_sz = txnp->payload_sz;
 
   demote_through( ctx, 1 );
   fd_failover_demoted_t demoted = pending_demoted( ctx );
   FD_TEST( demoted.last_vote_slot==31UL && demoted.state_len==good_sz );
-  FD_TEST( fd_memeq( ctx->pending+sizeof(fd_failover_demoted_t), ctx->cs.state, good_sz ) );
+  FD_TEST( fd_memeq( ctx->pending+sizeof(fd_failover_demoted_t), ctx->current_tower.state, good_sz ) );
   controller_fini( ctx );
 
   /* A standby keeps no tower, and the first vote under the new key
-     already counts while its switch answer is on the way. */
+     already counts while its switch response is on the way. */
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   consume_slot_done( ctx, &done );
-  FD_TEST( !ctx->cs.valid );
+  FD_TEST( !ctx->current_tower.valid );
   ctx->action = FD_FAILOVER_ACTION_PROMOTE_SWITCH;
   consume_slot_done( ctx, &done );
-  FD_TEST( ctx->cs.valid && ctx->cs.tip==31UL );
+  FD_TEST( ctx->current_tower.valid && ctx->current_tower.tip==31UL );
   controller_fini( ctx );
 
   /* after_credit folds in the slot done that reaches the halt watermark
@@ -574,7 +573,7 @@ test_final_tower( void ) {
   fd_memcpy( msg_mem, &done, sizeof(done) );
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 30UL );
+  make_tower( &ctx->current_tower, 30UL );
   ctx->last_vote_slot  = 30UL;
   ctx->member_cert_set = 1;
   ctx->tower_in_idx    = 3UL;
@@ -595,8 +594,8 @@ test_final_tower( void ) {
   FD_LOG_NOTICE(( "pass: the final tower comes from the vote transaction" ));
 }
 
-/* test_before_frag_admits: switch answers and commands get through.  A
-   dropped switch answer would leave the switch hanging forever. */
+/* test_before_frag_admits: switch responses and commands get through.  A
+   dropped switch response would leave the switch hanging forever. */
 static void
 test_before_frag_admits( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
@@ -604,13 +603,11 @@ test_before_frag_admits( void ) {
   ctx->admin_in_idx = 1UL;
   FD_TEST( !before_frag( ctx, 0UL, 0UL, FD_TOWER_SIG_SLOT_DONE     ) );
   FD_TEST(  before_frag( ctx, 0UL, 1UL, FD_TOWER_SIG_SLOT_DONE+1UL ) );
-  FD_TEST( !before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_CONTROL_REQ  ) );
-  FD_TEST( !before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_STATUS_REQ   ) );
-  FD_TEST( !before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_SWITCH_RESP  ) );
+  FD_TEST( !before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_REQUEST     ) );
+  FD_TEST( !before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_SWITCH_RESP ) );
   /* This tile publishes these, it never receives them. */
-  FD_TEST(  before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_CONTROL_RESP ) );
-  FD_TEST(  before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_STATUS_RESP  ) );
-  FD_TEST(  before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_SWITCH_REQ   ) );
+  FD_TEST(  before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_RESPONSE    ) );
+  FD_TEST(  before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_SWITCH_REQ  ) );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: before_frag admits every frame the tile acts on" ));
 }
@@ -621,12 +618,12 @@ static void
 test_demotion_order( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
 
   start_demotion( ctx, 1 );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && ctx->role==FD_FAILOVER_ROLE_ACTIVE );
   FD_TEST( ctx->handoff_target==77UL && ctx->send_demoted && ctx->handoff_id==5001UL );
-  /* The switch is asked for from the step, after a command's answer went
+  /* The switch is asked for from the step, after a command's response went
      out, and it names the junk key by its public key. */
   FD_TEST( ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT );
   step_controller( ctx, stem );
@@ -650,7 +647,7 @@ test_demotion_order( void ) {
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_DEMOTE_WAIT_ACK );
   FD_TEST( ctx->channel->self_hello.role==FD_FAILOVER_ROLE_STANDBY && !ctx->stuck );
   FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_PENDING );
-  FD_TEST( ctx->own_tower.valid && ctx->own_tower.tip==99UL );
+  FD_TEST( ctx->send_demoted && ctx->demoted_sz && pending_demoted( ctx ).last_vote_slot==99UL );
   fd_failover_demoted_t demoted = pending_demoted( ctx );
   FD_TEST( demoted.handoff_id==5002UL && demoted.target_boot_id==77UL );
   FD_TEST( demoted.last_vote_slot==99UL );
@@ -660,10 +657,10 @@ test_demotion_order( void ) {
      nothing. */
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 98UL );
+  make_tower( &ctx->current_tower, 98UL );
   demote_through( ctx, 1 );
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_IDLE && ctx->stuck );
-  FD_TEST( !ctx->pending_valid && !ctx->send_demoted && !ctx->own_tower.valid );
+  FD_TEST( !ctx->pending_valid && !ctx->send_demoted );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a demotion hands over only after the identity is gone" ));
 }
@@ -679,7 +676,7 @@ test_demotion_drain( void ) {
   /* The junk key is in, the stream is three frags short of the halt. */
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   start_demotion( ctx, 1 );
   step_controller( ctx, stem );
   ctx->tower_seen_seq = 796UL;
@@ -703,7 +700,7 @@ test_demotion_drain( void ) {
   /* A stream that never reaches the halt sends nothing at the deadline. */
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   start_demotion( ctx, 1 );
   step_controller( ctx, stem );
   ctx->tower_seen_seq = 700UL;
@@ -719,14 +716,14 @@ test_demotion_drain( void ) {
   /* A tower frag skipped since the cached tower sends nothing either. */
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   ctx->tower_gap = 1;
   start_demotion( ctx, 1 );
   step_controller( ctx, stem );
   ctx->tower_seen_seq = 799UL;
   switch_ok( ctx, 800UL );
   step_controller( ctx, stem );
-  FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->stuck && !ctx->pending_valid && !ctx->own_tower.valid );
+  FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->stuck && !ctx->pending_valid );
 
   /* A slot done counts once after_frag has it, one the stem abandons to
      an overrun never does.  Other frags count at once, and a skipped one
@@ -745,7 +742,7 @@ test_demotion_drain( void ) {
   FD_LOG_NOTICE(( "pass: the final tower waits for the halt watermark" ));
 }
 
-/* test_switch_overdue: a switch whose answer is overdue is waited for,
+/* test_switch_overdue: a switch whose response is overdue is waited for,
    on both sides.  Standing down would tell the peer nobody promoted
    while the staked key may be installed. */
 static void
@@ -762,7 +759,7 @@ test_switch_overdue( void ) {
   fd_memcpy( &req, ((fd_failover_bus_msg_t const *)bus_mem)->payload, sizeof(req) );
   FD_TEST( fd_memeq( req.identity, ctx->hello.staked_pubkey, 32UL ) );
 
-  /* Replay runs past the deadline with no answer.  We stay a standby,
+  /* Replay runs past the deadline with no response.  We stay a standby,
      keep the request open and raise stuck. */
   ctx->replay_slot = 1000UL;
   step_controller( ctx, stem );
@@ -770,14 +767,14 @@ test_switch_overdue( void ) {
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_PROMOTE_SWITCH );
   FD_TEST( ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_STAKED && ctx->stuck && ctx->switch_overdue );
 
-  /* The late answer is consumed, not dropped, and finishes the promotion. */
+  /* The late response is consumed, not dropped, and finishes the promotion. */
   switch_ok( ctx, 0UL );
   step_controller( ctx, stem );
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_ACTIVE && ctx->action==FD_FAILOVER_ACTION_IDLE && !ctx->stuck );
   FD_TEST( !ctx->peer_tower.valid && !ctx->pending_valid );
 
   /* Same on the demotion side, an overdue switch to the junk key is
-     waited for and the late answer completes the demotion. */
+     waited for and the late response completes the demotion. */
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
   start_demotion( ctx, 1 );
   step_controller( ctx, stem );
@@ -804,7 +801,7 @@ test_promotion_reject( void ) {
   ulong payload_sz = demoted_payload( payload, 42UL, OUR_BOOT_ID, 99UL );
   deliver( ctx, (ushort)FD_FAILOVER_MSG_DEMOTED, payload, payload_sz );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_REPLAY && ctx->peer_tower.valid && ctx->promote_peer );
-  FD_TEST( ctx->last_vote_slot==99UL && ctx->cs.tip==99UL );
+  FD_TEST( ctx->last_vote_slot==99UL && ctx->current_tower.tip==99UL );
 
   /* Replay is past the tip, so we hand the tower to the tower tile. */
   step_controller( ctx, stem );
@@ -918,7 +915,7 @@ test_promotion_wait_replay( void ) {
    A switch still in flight keeps it. */
 
 /* test_promotion_outcome_resent: a finished handoff's DEMOTED again gets
-   the same answer, so a peer that missed it is not left waiting. */
+   the same response, so a peer that missed it is not left waiting. */
 static void
 test_promotion_outcome_resent( void ) {
   uchar payload[ FD_FAILOVER_DEMOTED_PAYLOAD_MAX ];
@@ -938,9 +935,9 @@ test_promotion_outcome_resent( void ) {
   ctx->pending_valid = 0;
   deliver( ctx, (ushort)FD_FAILOVER_MSG_DEMOTED, payload, payload_sz );
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_ACTIVE && pending_ack( ctx )==42UL );
-  FD_TEST( !ctx->channel->metrics.wire_fatal_cnt );
+  FD_TEST( ctx->channel->state==FD_FAILOVER_SESSION_PAIRED );
 
-  /* The slot is busy, the answer is owed and goes out once it drains. */
+  /* The slot is busy, the response is owed and goes out once it drains. */
   deliver( ctx, (ushort)FD_FAILOVER_MSG_DEMOTED, payload, payload_sz );
   FD_TEST( ctx->reply_owed );
   ctx->pending_valid = 0;
@@ -961,7 +958,7 @@ test_promotion_outcome_resent( void ) {
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_HANDOFF_WAIT_RESULT && !ctx->peer_tower.valid );
   fd_failover_promote_rejected_t rej = pending_rejected( ctx );
   FD_TEST( rej.handoff_id==42UL && rej.reason==FD_FAILOVER_REJECT_ADOPTION_FAILED );
-  FD_TEST( !ctx->channel->metrics.wire_fatal_cnt );
+  FD_TEST( ctx->channel->state==FD_FAILOVER_SESSION_PAIRED );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a promotion outcome is resent when the peer misses the reply" ));
 }
@@ -979,7 +976,7 @@ test_demote_sends_nothing( void ) {
     ctx->own_floor  = 99UL;
     ctx->peer_floor = 98UL;
     if( paired ) pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-    make_tower( &ctx->cs, 99UL );
+    make_tower( &ctx->current_tower, 99UL );
     FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_DEMOTE, 0UL, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
     FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && !ctx->send_demoted && !ctx->handoff_target );
     step_controller( ctx, stem );
@@ -990,7 +987,7 @@ test_demote_sends_nothing( void ) {
     step_controller( ctx, stem );
     FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_IDLE && !ctx->stuck );
     FD_TEST( !ctx->pending_valid && !ctx->send_demoted && ctx->handoff_result==FD_FAILOVER_HANDOFF_NONE );
-    FD_TEST( !ctx->own_tower.valid && !ctx->peer_tower.valid );
+    FD_TEST( !ctx->peer_tower.valid );
     FD_TEST( ctx->own_floor==99UL && ctx->peer_floor==98UL );
 
     FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
@@ -1000,18 +997,18 @@ test_demote_sends_nothing( void ) {
     step_controller( ctx, stem );
     switch_ok( ctx, 0UL );
     step_controller( ctx, stem );
-    FD_TEST( ctx->role==FD_FAILOVER_ROLE_ACTIVE && !ctx->own_tower.valid && !ctx->pending_valid );
+    FD_TEST( ctx->role==FD_FAILOVER_ROLE_ACTIVE && !ctx->pending_valid );
     controller_fini( ctx );
   }
 
   /* A demote after a skipped tower frag has no final tower to keep, it
      stands down stuck. */
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   ctx->tower_gap = 1;
   demote_through( ctx, 0 );
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_IDLE && ctx->stuck );
-  FD_TEST( !ctx->own_tower.valid && !ctx->pending_valid && !ctx->send_demoted );
+  FD_TEST( !ctx->pending_valid && !ctx->send_demoted );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a demote sends nothing and falls back to the vote account after peer fencing" ));
 }
@@ -1047,9 +1044,8 @@ test_malformed_control( void ) {
   for( ulong i=0UL; i<4UL; i++ ) {
     fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
     pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-    ctx->channel->active = 0; /* a live session, so a hangup drops it */
+    ctx->channel->paired_idx = 0; /* a live session, so a hangup drops it */
     deliver( ctx, types[ i ], payload, sizes[ i ] );
-    FD_TEST( ctx->channel->metrics.wire_fatal_cnt==1UL );
     FD_TEST( fd_failover_channel_state( ctx->channel )!=FD_FAILOVER_SESSION_PAIRED );
     FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE && !ctx->pending_valid && !ctx->peer_tower.valid );
     controller_fini( ctx );
@@ -1063,7 +1059,7 @@ static void
 test_boot_binding( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   demote_through( ctx, 1 );
   ulong handoff_id = pending_demoted( ctx ).handoff_id;
 
@@ -1088,7 +1084,7 @@ test_boot_binding( void ) {
   step_controller( ctx, stem );
   FD_TEST( !ctx->pending_valid && !ctx->send_demoted && ctx->action==FD_FAILOVER_ACTION_IDLE );
   FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_RESTARTED && !ctx->taken );
-  FD_TEST( !ctx->own_tower.valid && !ctx->peer_tower.valid );
+  FD_TEST( !ctx->peer_tower.valid );
   deliver_ack( ctx, handoff_id );
   FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_RESTARTED && !ctx->taken );
   controller_fini( ctx );
@@ -1102,7 +1098,7 @@ test_repeated_handoff_tower( void ) {
   uchar payload[ FD_FAILOVER_DEMOTED_PAYLOAD_MAX ];
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   pair_demoter( ctx, 77UL, 1000L );
-  make_tower( &ctx->cs, 50UL );
+  make_tower( &ctx->current_tower, 50UL );
   ctx->tower_gap   = 1; /* a frag skipped earlier, the promotion clears it */
   ctx->replay_slot = 120UL;
   ulong payload_sz = demoted_payload( payload, 42UL, OUR_BOOT_ID, 120UL );
@@ -1123,13 +1119,12 @@ test_repeated_handoff_tower( void ) {
   FD_LOG_NOTICE(( "pass: an immediate handoff back hands over the adopted tower" ));
 }
 
-/* test_ack_during_switch: an answer while the junk switch is in flight
-   answers nothing, since no DEMOTED went out yet. */
+/* An ACK during the junk switch confirms nothing, no DEMOTED went out. */
 static void
 test_ack_during_switch( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   start_demotion( ctx, 1 );
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && ctx->send_demoted );
@@ -1137,7 +1132,7 @@ test_ack_during_switch( void ) {
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && ctx->send_demoted && !ctx->taken );
   deliver_rejected( ctx, ctx->handoff_id, (uchar)FD_FAILOVER_REJECT_BUSY );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && ctx->send_demoted );
-  FD_TEST( !ctx->channel->metrics.wire_fatal_cnt );
+  FD_TEST( ctx->channel->state==FD_FAILOVER_SESSION_PAIRED );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a promotion outcome is ignored while the junk switch is in flight" ));
 }
@@ -1164,7 +1159,7 @@ test_adopt_unreplayed_retry( void ) {
   ctx->replay_slot++;
   step_controller( ctx, stem );
   FD_TEST( !ctx->adopt_retry && ctx->adopt_expected_id!=first );
-  /* An answer to the first request is stale. */
+  /* An response to the first request is stale. */
   ctx->adopt_result       = (fd_tower_adopt_result_t){ .result=FD_TOWER_ADOPT_SUCCESS, .vote_slot=99UL };
   ctx->adopt_result_id    = first;
   ctx->adopt_result_fresh = 1;
@@ -1192,7 +1187,7 @@ test_adopt_unreplayed_retry( void ) {
   FD_LOG_NOTICE(( "pass: a tower short of replay is retried until the deadline" ));
 }
 
-/* Runs one tower_failov frag with the tower tile's answer through the
+/* Runs one tower_failov frag with the tower tile's response through the
    stem callbacks. */
 static void
 adopt_frag( fd_failover_tile_ctx_t * ctx,
@@ -1206,8 +1201,8 @@ adopt_frag( fd_failover_tile_ctx_t * ctx,
   after_frag ( ctx, ctx->adopt_in_idx, 0UL, sig, sizeof(answer), 0UL, 0UL, stem );
 }
 
-/* test_adopt_answer_id: the tower tile's answer is matched to our
-   request by the frag sig, a late answer to an earlier request is not
+/* test_adopt_answer_id: the tower tile's response is matched to our
+   request by the frag sig, a late response to an earlier request is not
    taken for the current one. */
 static void
 test_adopt_answer_id( void ) {
@@ -1228,7 +1223,7 @@ test_adopt_answer_id( void ) {
   ulong second = ctx->adopt_expected_id;
   FD_TEST( second!=first );
 
-  /* A late answer to the first request says nothing about the second. */
+  /* A late response to the first request says nothing about the second. */
   adopt_frag( ctx, first, FD_TOWER_ADOPT_SUCCESS, 99UL );
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT && ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT );
@@ -1297,7 +1292,7 @@ test_late_promote_ack( void ) {
   FD_TEST( ctx->send_demoted && ctx->handoff_result==FD_FAILOVER_HANDOFF_PENDING );
   deliver_ack( ctx, 5001UL );
   FD_TEST( !ctx->send_demoted && !ctx->stuck && ctx->action==FD_FAILOVER_ACTION_IDLE );
-  FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_TAKEN && ctx->taken && ctx->taken_boot_id==77UL );
+  FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_TAKEN && ctx->taken && ctx->handoff_target==77UL );
   deliver_ack( ctx, 5001UL );
   FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_TAKEN );
 
@@ -1315,19 +1310,18 @@ test_late_promote_ack( void ) {
   ctx->send_demoted = 1;
   ctx->handoff_id   = 5002UL;
   make_tower( &ctx->peer_tower, 99UL );
-  make_tower( &ctx->own_tower, 99UL );
   ctx->own_floor  = 99UL;
   ctx->peer_floor = 98UL;
   deliver_rejected( ctx, 5002UL, (uchar)FD_FAILOVER_REJECT_BUSY );
   FD_TEST( !ctx->send_demoted && ctx->stuck && ctx->handoff_result==FD_FAILOVER_HANDOFF_DECLINED );
-  FD_TEST( !ctx->peer_tower.valid && !ctx->own_tower.valid && ctx->own_floor==99UL && ctx->peer_floor==98UL );
+  FD_TEST( !ctx->peer_tower.valid && ctx->own_floor==99UL && ctx->peer_floor==98UL );
   FD_TEST( promote_source( ctx )==FD_FAILOVER_SOURCE_VOTE_ACCOUNT );
-  FD_TEST( !ctx->channel->metrics.wire_fatal_cnt );
+  FD_TEST( ctx->channel->state==FD_FAILOVER_SESSION_PAIRED );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a late acknowledgement is acted on and an unowed one is ignored" ));
 }
 
-/* test_bus_control_ordering: a command's answer goes out before the
+/* test_bus_control_ordering: a command's response goes out before the
    switch request it leads to. */
 static void
 test_bus_control_ordering( void ) {
@@ -1336,16 +1330,16 @@ test_bus_control_ordering( void ) {
 
   fd_memset( &ctx->bus_req, 0, sizeof(ctx->bus_req) );
   ctx->bus_req.nonce = 77UL;
-  fd_adminctl_failover_control_t req = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, .cmd=FD_ADMINCTL_FAILOVER_CMD_DEMOTE };
+  fd_adminctl_failover_req_t req = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, .cmd=FD_ADMINCTL_FAILOVER_CMD_DEMOTE };
   fd_memcpy( ctx->bus_req.payload, &req, sizeof(req) );
   serve_bus_request( ctx, stem, 1000L );
 
-  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_CONTROL_RESP );
+  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_RESPONSE );
   fd_failover_bus_msg_t const * ans = fd_chunk_to_laddr_const( ctx->admin_out_mem, pub_mcache[ 0 ].chunk );
   FD_TEST( ans->nonce==77UL && ans->result==FD_ADMINCTL_RESULT_SUCCESS );
   fd_adminctl_failover_control_resp_t answer;
   fd_memcpy( &answer, ans->payload, sizeof(answer) );
-  FD_TEST( answer.version==FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION );
+  FD_TEST( answer.version==FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION );
   FD_TEST( answer.role==(uchar)FD_FAILOVER_ROLE_ACTIVE && answer.action==(uchar)FD_FAILOVER_ACTION_DEMOTE_SWITCH );
   FD_TEST( ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT );
 
@@ -1359,7 +1353,7 @@ test_bus_control_ordering( void ) {
   FD_LOG_NOTICE(( "pass: a command's answer goes out before its switch request" ));
 }
 
-/* test_bus_refusal_once: a refused command is answered once, with the
+/* test_bus_refusal_once: a refused command is responded to once, with the
    refusal and the request's nonce. */
 static void
 test_bus_refusal_once( void ) {
@@ -1373,17 +1367,17 @@ test_bus_refusal_once( void ) {
   fd_failover_bus_msg_t * msg = (fd_failover_bus_msg_t *)req_mem;
   fd_memset( msg, 0, sizeof(*msg) );
   msg->nonce = 77UL;
-  fd_adminctl_failover_control_t req = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, .cmd=FD_ADMINCTL_FAILOVER_CMD_DEMOTE };
+  fd_adminctl_failover_req_t req = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, .cmd=FD_ADMINCTL_FAILOVER_CMD_DEMOTE };
   fd_memcpy( msg->payload, &req, sizeof(req) );
-  FD_TEST( !before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_CONTROL_REQ ) );
-  during_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_CONTROL_REQ, 0UL, sizeof(*msg), 0UL );
-  after_frag ( ctx, 1UL, 0UL, FD_FAILOVER_BUS_CONTROL_REQ, sizeof(*msg), 0UL, 0UL, stem );
+  FD_TEST( !before_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_REQUEST ) );
+  during_frag( ctx, 1UL, 0UL, FD_FAILOVER_BUS_REQUEST, 0UL, sizeof(*msg), 0UL );
+  after_frag ( ctx, 1UL, 0UL, FD_FAILOVER_BUS_REQUEST, sizeof(*msg), 0UL, 0UL, stem );
   for( ulong i=0UL; i<2UL; i++ ) {
     int busy = 0;
     after_credit( ctx, stem, NULL, &busy );
   }
 
-  FD_TEST( stem->seqs[ 0 ]==1UL && pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_CONTROL_RESP );
+  FD_TEST( stem->seqs[ 0 ]==1UL && pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_RESPONSE );
   fd_failover_bus_msg_t const * ans = fd_chunk_to_laddr_const( ctx->admin_out_mem, pub_mcache[ 0 ].chunk );
   FD_TEST( ans->nonce==77UL && ans->result==FD_FAILOVER_CONTROL_RESULT_BAD_ROLE );
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && ctx->action==FD_FAILOVER_ACTION_IDLE );
@@ -1391,17 +1385,13 @@ test_bus_refusal_once( void ) {
   FD_LOG_NOTICE(( "pass: a refused command is answered once with its refusal" ));
 }
 
-/* test_promote_guard: promote is refused while the peer holds or may
-   hold the identity, and on the operator's word otherwise. */
-
-/* test_vote_account_fallback: with no tower to adopt, promote falls back automatically and
-   sends the tower tile an empty request for the vote account tower. */
+/* Promotion selects eligible saved state before the vote account. */
 static void
 test_vote_account_fallback( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->cs.valid );
+  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->current_tower.valid );
   FD_TEST( ctx->last_vote_slot==FD_FAILOVER_SLOT_NULL );
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
@@ -1414,24 +1404,20 @@ test_vote_account_fallback( void ) {
   FD_TEST( ctx->role==FD_FAILOVER_ROLE_ACTIVE && !ctx->pending_valid );
   controller_fini( ctx );
 
-  /* A tower of our own is taken first when it is eligible. */
+  /* An eligible saved peer tower is selected before the account. */
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  make_tower( &ctx->own_tower, 99UL );
+  make_tower( &ctx->peer_tower, 99UL );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_FORCE, 1000L )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_OWN && ctx->adopt.tip==99UL );
+  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_PEER && ctx->adopt.tip==99UL );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: promote selects saved state before automatic vote-account fallback" ));
 }
-
-/* test_coverage_floor: the adopted tower has to reach the highest last
-   vote the peer reported.  The vote account may also go ahead once
-   replay passes that floor by the slack. */
 
 /* test_own_floor: the votes we signed while active this boot raise the
    floor too, and a later promote has to cover them. */
 static void
 test_own_floor( void ) {
-  long  later = 1000L+FD_FAILOVER_CHANNEL_SILENCE_NANOS;
+  long  later = 1000L+FD_FAILOVER_CHANNEL_IDLE_NANOS;
   ulong yes   = FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE;
 
   /* A standby's slot done is not ours to cover.  The vote transaction
@@ -1450,7 +1436,7 @@ test_own_floor( void ) {
 
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   consume_slot_done( ctx, &done );
-  FD_TEST( ctx->own_floor==150UL && !ctx->cs.valid );
+  FD_TEST( ctx->own_floor==150UL && !ctx->current_tower.valid );
   done.vote_slot = 140UL;
   consume_slot_done( ctx, &done );
   FD_TEST( ctx->own_floor==150UL );
@@ -1458,7 +1444,7 @@ test_own_floor( void ) {
   /* A demote with no final tower leaves the vote account, which has to
      reach our last vote, and a peer tower short of it is skipped. */
   demote_through( ctx, 0 );
-  FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY && !ctx->own_tower.valid );
+  FD_TEST( ctx->role==FD_FAILOVER_ROLE_STANDBY );
   make_tower( &ctx->peer_tower, 145UL );
   ctx->replay_slot = 200UL;
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, later )==FD_ADMINCTL_RESULT_SUCCESS );
@@ -1510,13 +1496,13 @@ test_promote_clock( void ) {
      on the clock as well. */
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   ctx->peer_floor = 150UL;
-  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, 1000L+FD_FAILOVER_CHANNEL_SILENCE_NANOS )==FD_ADMINCTL_RESULT_SUCCESS );
+  FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, 1000L+FD_FAILOVER_CHANNEL_IDLE_NANOS )==FD_ADMINCTL_RESULT_SUCCESS );
   before = fd_failover_clock();
   step_controller( ctx, stem );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_PROMOTE_WAIT_ADOPT );
   FD_TEST( ctx->promote_until>=before+(long)(FD_FAILOVER_FLOOR_SLACK_SLOTS+FD_FAILOVER_DEADLINE_SLOTS)*step );
   /* An outstanding request cannot be bypassed by issuing another one,
-     even with FORCE and even if its answer never arrives. */
+     even with FORCE and even if its response never arrives. */
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes, 1000L )==FD_FAILOVER_CONTROL_RESULT_IN_PROGRESS );
   ctx->promote_until = fd_failover_clock();
   step_controller( ctx, stem );
@@ -1554,22 +1540,22 @@ test_switch_request( void ) {
   /* One request at a time. */
   FD_TEST( request_switch( ctx, stem, FD_FAILOVER_SWITCH_KEY_JUNK )==ULONG_MAX );
 
-  /* A stale answer is dropped and the request stays out. */
+  /* A stale response is dropped and the request stays out. */
   FD_TEST( !switch_answer( ctx, id-1UL ) );
   FD_TEST( ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_STAKED && !ctx->switch_result_fresh );
 
-  /* The matching answer completes it. */
+  /* The matching response completes it. */
   FD_TEST( switch_answer( ctx, id ) );
-  FD_TEST( ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT && ctx->switch_result_fresh && ctx->switch_result_id==id );
+  FD_TEST( ctx->switch_pending_key==FD_FAILOVER_SWITCH_KEY_CNT && ctx->switch_result_fresh && ctx->switch_request_id==id );
 
-  /* An answer with nothing out is dropped. */
+  /* An response with nothing out is dropped. */
   ctx->switch_result_fresh = 0;
   FD_TEST( !switch_answer( ctx, id ) && !ctx->switch_result_fresh );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: one identity switch at a time and only its own answer counts" ));
 }
 
-/* test_switch_response_integrity: the accepted switch answer stays live
+/* test_switch_response_integrity: the accepted switch response stays live
    while the tower drains.  A stale, repeated or abandoned frame never
    overwrites the watermark we drain toward. */
 static void
@@ -1578,7 +1564,7 @@ test_switch_response_integrity( void ) {
   for( ulong fault=0UL; fault<3UL; fault++ ) {
     fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
     pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-    make_tower( &ctx->cs, 99UL );
+    make_tower( &ctx->current_tower, 99UL );
     ctx->admin_in_idx = 1UL;
     ctx->admin_in_mem = (fd_wksp_t *)ans_mem;
     start_demotion( ctx, 1 );
@@ -1593,7 +1579,7 @@ test_switch_response_integrity( void ) {
     step_controller( ctx, stem );
     FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_SWITCH && ctx->switch_result_fresh && !ctx->pending_valid );
 
-    /* An old nonce, the same answer again, or a copy the stem abandons
+    /* An old nonce, the same response again, or a copy the stem abandons
        before after_frag, each with a lower watermark. */
     if( fault==0UL ) answer->nonce--;
     result.tower_watermark = 100UL;
@@ -1613,11 +1599,7 @@ test_switch_response_integrity( void ) {
   FD_LOG_NOTICE(( "pass: stale, repeated and abandoned switch answers keep the accepted watermark" ));
 }
 
-/* test_status_snapshot: failover status reports the controller, the
-   peer and what promote would do, the same answer promote gives. */
-
-/* test_bus_status: a status request is answered with the snapshot and
-   its nonce, and changes nothing. */
+/* A status response includes the request nonce and changes no state. */
 static void
 test_bus_status( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
@@ -1626,12 +1608,12 @@ test_bus_status( void ) {
 
   fd_memset( &ctx->bus_req, 0, sizeof(ctx->bus_req) );
   ctx->bus_req.nonce = 78UL;
-  ctx->bus_req_sig   = FD_FAILOVER_BUS_STATUS_REQ;
-  fd_adminctl_failover_status_req_t req = { .version=FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION };
+
+  fd_adminctl_failover_req_t req = { .cmd=FD_ADMINCTL_FAILOVER_CMD_STATUS, .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION };
   fd_memcpy( ctx->bus_req.payload, &req, sizeof(req) );
   serve_bus_request( ctx, stem, 1000L );
 
-  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_STATUS_RESP && pub_mcache[ 0 ].sz==sizeof(fd_failover_bus_msg_t) );
+  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_RESPONSE && pub_mcache[ 0 ].sz==sizeof(fd_failover_bus_msg_t) );
   fd_failover_bus_msg_t const * ans = fd_chunk_to_laddr_const( ctx->admin_out_mem, pub_mcache[ 0 ].chunk );
   FD_TEST( ans->nonce==78UL && ans->result==FD_ADMINCTL_RESULT_SUCCESS );
   fd_adminctl_failover_status_resp_t got;

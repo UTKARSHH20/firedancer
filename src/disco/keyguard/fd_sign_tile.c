@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../tiles.h"
 
+#include <linux/futex.h>
 #include "generated/fd_sign_tile_seccomp.h"
 
 #include "../keyguard/fd_keyguard.h"
@@ -54,11 +55,11 @@ typedef struct {
 
   fd_keyswitch_t *  av_keyswitch; /* authorized voters */
 
-  uchar const *     public_key;
-  uchar const *     private_key;
-  uchar *           identity_key;        /* writable identity keypair, NULL under failover */
-  uchar const *     failover_junk_key;   /* read only, loaded at boot under failover */
-  uchar const *     failover_staked_key;
+  uchar const * public_key;
+  uchar const * private_key;
+  uchar *       identity_key;      /* writable identity keypair, NULL under failover */
+  uchar const * failover_junk_key; /* read only, loaded at boot under failover */
+  uchar const * failover_staked_key;
 
   uchar *           bls_private_key; /* alpenglow BLS voting key */
 

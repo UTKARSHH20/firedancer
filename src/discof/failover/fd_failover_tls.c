@@ -35,7 +35,10 @@ fd_failover_tls_ctx_init( fd_failover_tls_ctx_t * ctx,
   fd_memcpy( ctx->private_key, keypair, 32UL );
 
   uchar seed[ 32 ];
-  if( FD_UNLIKELY( !fd_rng_secure( seed, 32UL ) ) ) { fd_failover_tls_ctx_fini( ctx ); return -1; }
+  if( FD_UNLIKELY( !fd_rng_secure( seed, 32UL ) ) ) {
+    fd_failover_tls_ctx_fini( ctx );
+    return -1;
+  }
   fd_chacha_rng_t * rng = fd_chacha_rng_join( fd_chacha_rng_new( ctx->rng, FD_CHACHA_RNG_MODE_MOD ) );
   FD_TEST( rng );
   fd_chacha_rng_init( rng, seed, FD_CHACHA_RNG_ALGO_CHACHA20 );
@@ -55,6 +58,7 @@ fd_failover_tls_ctx_init( fd_failover_tls_ctx_t * ctx,
   tls->alpn_sz = sizeof(ALPN)-1UL;
   tls->quic    = 0;
 
+  /* The key and TLS configuration are ready for new connections. */
   ctx->ready = 1;
   return 0;
 }
@@ -63,6 +67,7 @@ void
 fd_failover_tls_ctx_fini( fd_failover_tls_ctx_t * ctx ) {
   uchar * private_key = ctx->private_key;
   if( FD_LIKELY( private_key ) ) fd_memzero_explicit( private_key, 32UL );
+  /* Wiping the context prevents new connections until reinitialization. */
   fd_memzero_explicit( ctx, sizeof(*ctx) );
   ctx->private_key = private_key;
 }
@@ -73,10 +78,10 @@ fd_failover_tls_new( fd_failover_tls_t *     tls,
                      int                     fd,
                      int                     dial_peer ) {
   if( FD_UNLIKELY( !ctx->ready ) ) return -1;
+  /* Start an unverified, unpaired connection. */
   fd_memset( tls, 0, sizeof(*tls) );
   tls->fd = fd;
   fd_tlsrec_conn_init( &tls->conn, &ctx->tls, !dial_peer );
-  tls->conn.application_logs = 1; /* channel logs with peer address and a bounded retry count */
   /* Fresh X25519 key share per connection, straight from the kernel.  It
      never passes through the RNG, whose state outlives the connection and
      could otherwise replay the key after the connection is wiped.  The
@@ -100,6 +105,7 @@ fd_failover_tls_fini( fd_failover_tls_t * tls ) {
   }
   fd_memzero_explicit( &tls->conn, sizeof(tls->conn) );
   fd_memzero_explicit( &tls->sock, sizeof(tls->sock) );
+  /* Closing clears both TLS verification and HELLO pairing. */
   tls->fd       = -1;
   tls->verified = 0;
   tls->paired   = 0;
@@ -121,7 +127,7 @@ pull( fd_failover_tls_t * tls ) {
   if( FD_UNLIKELY( !tls->read_budget ) ) return 0;
   tls->read_budget--;
   ulong rx_sz = 0UL;
-  int rc = fd_tlsrec_sock_rx( &tls->sock, &tls->conn, tls->fd, &rx_sz );
+  int   rc    = fd_tlsrec_sock_rx( &tls->sock, &tls->conn, tls->fd, &rx_sz );
   if( FD_UNLIKELY( rc ) ) {
     tls->peer_closed = rc==FD_TLSREC_SOCK_ERR_EOF;
     return -1;
@@ -135,7 +141,8 @@ pull( fd_failover_tls_t * tls ) {
 
 int
 fd_failover_tls_handshake( fd_failover_tls_t * tls ) {
-  if( FD_LIKELY( tls->verified ) ) return 1;
+  if( FD_LIKELY( tls->verified ) ) return 1; /* Verification is final for this connection. */
+  /* A failed handshake stays failed until the channel closes it. */
   if( FD_UNLIKELY( fd_tlsrec_conn_is_failed( &tls->conn ) ) ) {
     FD_LOG_DEBUG(( "failover TLS handshake failed: %s", fd_tls_reason_cstr( tls->conn.hs.base.reason ) ));
     return -1;
@@ -147,7 +154,7 @@ fd_failover_tls_handshake( fd_failover_tls_t * tls ) {
       FD_LOG_DEBUG(( "failover TLS handshake failed: %s", fd_tls_reason_cstr( tls->conn.hs.base.reason ) ));
       return -1;
     }
-    if( FD_LIKELY( !fd_tlsrec_conn_is_ready( &tls->conn ) ) ) return 0;
+    if( FD_LIKELY( !fd_tlsrec_conn_is_ready( &tls->conn ) ) ) return 0; /* Continue on a later poll. */
   }
 
   /* Handshake done, the peer signed with some key and agreed on our ALPN.
@@ -155,7 +162,8 @@ fd_failover_tls_handshake( fd_failover_tls_t * tls ) {
 
   if( !fd_tlsrec_conn_is_server( &tls->conn ) ) {
     fd_tls_estate_cli_t const * cli = &tls->conn.hs.cli;
-    if( FD_UNLIKELY( cli->server_key_type!=FD_TLS_KEY_ED25519 || cli->server_pubkey_len!=32UL || !cli->alpn_negotiated ) ) return -1;
+    if( FD_UNLIKELY( cli->server_key_type!=FD_TLS_KEY_ED25519 ||
+                     cli->server_pubkey_len!=32UL || !cli->alpn_negotiated ) ) return -1;
     fd_memcpy( tls->peer_pubkey, cli->server_pubkey, 32UL );
   } else {
     /* fd_tls only gets here with a client cert and a CertificateVerify
@@ -163,6 +171,7 @@ fd_failover_tls_handshake( fd_failover_tls_t * tls ) {
     fd_tls_estate_srv_t const * srv = &tls->conn.hs.srv;
     fd_memcpy( tls->peer_pubkey, srv->client_pubkey, 32UL );
   }
+  /* TLS verified the peer key, HELLO must still authorize the member. */
   tls->verified = 1;
   return 1;
 }
@@ -173,7 +182,10 @@ fd_failover_tls_read( fd_failover_tls_t * tls,
                       ulong               sz ) {
   if( FD_UNLIKELY( fd_tlsrec_conn_is_failed( &tls->conn ) ) ) return -1L;
   if( FD_LIKELY( !fd_tlsrec_sock_rx_avail( &tls->sock ) ) ) {
-    if( FD_UNLIKELY( tls->conn.rx_closed ) ) { tls->peer_closed = 1; return -1L; }
+    if( FD_UNLIKELY( tls->conn.rx_closed ) ) {
+      tls->peer_closed = 1;
+      return -1L;
+    }
     if( FD_UNLIKELY( fd_tlsrec_sock_flush( &tls->sock, tls->fd )<0 ) ) return -1L;
     if( FD_UNLIKELY( pull( tls ) ) ) return -1L;
   }

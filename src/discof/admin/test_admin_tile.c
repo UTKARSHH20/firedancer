@@ -123,10 +123,10 @@ ev_was( int type, int result ) {
 
 static ulong
 control( ulong cmd, ulong flags ) {
-  fd_adminctl_failover_control_t req = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, .cmd=cmd, .flags=flags };
+  fd_adminctl_failover_req_t req = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, .cmd=cmd, .flags=flags };
   void * payload;
-  ulong idx = request( FD_ADMINCTL_CMD_FAILOVER_CONTROL, &req, sizeof(req), &payload );
-  failover_control( &ctx, stem, idx, payload, sizeof(req) );
+  ulong idx = request( FD_ADMINCTL_CMD_FAILOVER, &req, sizeof(req), &payload );
+  failover_request( &ctx, stem, idx, payload, sizeof(req) );
   return idx;
 }
 
@@ -162,35 +162,35 @@ test_control_abi( void ) {
   ctx.failov_out_idx    = ULONG_MAX;
   ctx.failov_in_idx     = ULONG_MAX;
   ev_init();
-  ulong versions[] = { 0UL, FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, 2UL };
+  ulong versions[] = { 0UL, FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, 2UL };
   ulong sizes[]    = { 0UL, 7UL, 8UL, 23UL, 24UL, 25UL, FD_ADMINCTL_PAYLOAD_MAX };
   for( ulong v=0UL; v<sizeof(versions)/sizeof(versions[0]); v++ ) {
     for( ulong s=0UL; s<sizeof(sizes)/sizeof(sizes[0]); s++ ) {
       uchar data[ FD_ADMINCTL_PAYLOAD_MAX ] = {0};
       FD_STORE( ulong, data, versions[ v ] );
       void * payload;
-      ulong idx = request( FD_ADMINCTL_CMD_FAILOVER_CONTROL, data, sizes[ s ], &payload );
-      failover_control( &ctx, stem, idx, payload, sizes[ s ] );
+      ulong idx = request( FD_ADMINCTL_CMD_FAILOVER, data, sizes[ s ], &payload );
+      failover_request( &ctx, stem, idx, payload, sizes[ s ] );
       ulong expected = sizes[ s ]<8UL                                              ? FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH
-                     : versions[ v ]!=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION ? FD_ADMINCTL_RESULT_ABI_VERSION_MISMATCH
+                     : versions[ v ]!=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION ? FD_ADMINCTL_RESULT_ABI_VERSION_MISMATCH
                      : sizes[ s ]!=24UL                                            ? FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH
                      :                                                               FD_ADMINCTL_RESULT_UNSUPPORTED;
       int      expected_ev = expected==FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH    ? FD_EVENT_ADMIN_COMMAND_RESULT_ABI_SIZE_MISMATCH
                            : expected==FD_ADMINCTL_RESULT_ABI_VERSION_MISMATCH ? FD_EVENT_ADMIN_COMMAND_RESULT_ABI_VERSION_MISMATCH
                            :                                                     FD_EVENT_ADMIN_COMMAND_RESULT_UNSUPPORTED;
       FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==expected );
-      FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, expected_ev ) );
+      FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, expected_ev ) );
     }
   }
 
   ctx.failover_enabled = 1;
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL ) )==FD_ADMINCTL_RESULT_UNSUPPORTED );
-  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, FD_EVENT_ADMIN_COMMAND_RESULT_UNSUPPORTED ) );
+  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, FD_EVENT_ADMIN_COMMAND_RESULT_UNSUPPORTED ) );
   bus_init();
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_CNT, 0UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
-  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, FD_EVENT_ADMIN_COMMAND_RESULT_UNKNOWN_COMMAND ) );
+  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, FD_EVENT_ADMIN_COMMAND_RESULT_UNKNOWN_COMMAND ) );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 8UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
-  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, FD_EVENT_ADMIN_COMMAND_RESULT_UNKNOWN_COMMAND ) );
+  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, FD_EVENT_ADMIN_COMMAND_RESULT_UNKNOWN_COMMAND ) );
 
   for( ulong cmd=FD_ADMINCTL_FAILOVER_CMD_HANDOFF; cmd<=FD_ADMINCTL_FAILOVER_CMD_DEMOTE; cmd++ ) {
     FD_TEST( fd_adminctl_wait( ctx.adminctl, control( cmd, 4UL /* retired RECOVER flag */ ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
@@ -211,30 +211,30 @@ test_bus_forwarding( void ) {
   bus_init();
   ulong idx = control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE );
   FD_TEST( ctx.failover_slot_idx==idx && pub_seq==1UL );
-  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_CONTROL_REQ && pub_mcache[ 0 ].sz==sizeof(fd_failover_bus_msg_t) );
+  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_REQUEST && pub_mcache[ 0 ].sz==sizeof(fd_failover_bus_msg_t) );
   fd_failover_bus_msg_t const * sent = (fd_failover_bus_msg_t const *)out_mem;
-  fd_adminctl_failover_control_t fwd;
+  fd_adminctl_failover_req_t fwd;
   fd_memcpy( &fwd, sent->payload, sizeof(fwd) );
   ulong nonce = sent->nonce;
   FD_TEST( nonce==ctx.failover_nonce );
-  FD_TEST( fwd.version==FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION );
+  FD_TEST( fwd.version==FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION );
   FD_TEST( fwd.cmd==FD_ADMINCTL_FAILOVER_CMD_PROMOTE && fwd.flags==(FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE) );
 
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_DEMOTE, 0UL ) )==FD_FAILOVER_CONTROL_RESULT_BUSY );
   FD_TEST( ctx.failover_slot_idx==idx && pub_seq==1UL );
 
-  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, .role=(uchar)FD_FAILOVER_ROLE_ACTIVE, .action=3 };
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce+1UL, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, .role=(uchar)FD_FAILOVER_ROLE_ACTIVE, .action=3 };
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce+1UL, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==idx );
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 1 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 1 );
   FD_TEST( ctx.failover_slot_idx==idx );
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX );
 
   fd_adminctl_failover_control_resp_t got;
   ulong got_sz;
   FD_TEST( fd_adminctl_wait_response( ctx.adminctl, idx, &got, sizeof(got), &got_sz )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( got_sz==sizeof(got) && got.version==FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION );
+  FD_TEST( got_sz==sizeof(got) && got.version==FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION );
   FD_TEST( got.role==FD_FAILOVER_ROLE_ACTIVE && got.action==3 );
 
   /* A refusal from the failover tile comes back with its result code
@@ -242,7 +242,7 @@ test_bus_forwarding( void ) {
   idx   = control( FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL );
   nonce = ((fd_failover_bus_msg_t const *)out_mem)->nonce;
   answer.role = (uchar)FD_FAILOVER_ROLE_STANDBY;
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, 0x5001UL, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, 0x5001UL, &answer, sizeof(answer), 0 );
   FD_TEST( fd_adminctl_wait_response( ctx.adminctl, idx, &got, sizeof(got), &got_sz )==0x5001UL );
   FD_TEST( got_sz==sizeof(got) && got.role==FD_FAILOVER_ROLE_STANDBY );
   FD_LOG_NOTICE(( "pass: failover commands forward over the bus, busy while parked, stale answers dropped" ));
@@ -268,13 +268,13 @@ test_bus_answer_waiting( void ) {
   after_credit( &ctx, stem, &poll_in, &busy );
   FD_TEST( ctx.failover_slot_idx==idx );
 
-  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, .role=(uchar)FD_FAILOVER_ROLE_STANDBY };
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, .role=(uchar)FD_FAILOVER_ROLE_STANDBY };
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX );
   fd_adminctl_failover_control_resp_t got;
   ulong got_sz;
   FD_TEST( fd_adminctl_wait_response( ctx.adminctl, idx, &got, sizeof(got), &got_sz )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( got_sz==sizeof(got) && got.version==FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION );
+  FD_TEST( got_sz==sizeof(got) && got.version==FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION );
 
   /* The stem already read the last frag, so nothing waits and the
      deadline counts. */
@@ -307,8 +307,8 @@ test_bus_unresponsive( void ) {
   FD_TEST( fd_adminctl_wait_response( ctx.adminctl, idx, NULL, 0UL, &sz )==FD_FAILOVER_CONTROL_RESULT_UNRESPONSIVE );
   FD_TEST( !sz && ctx.failover_slot_idx==ULONG_MAX );
 
-  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION };
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION };
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX );
 
   /* The next command gets a new nonce, so the late answer cannot
@@ -316,9 +316,9 @@ test_bus_unresponsive( void ) {
   idx = control( FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL );
   ulong next_nonce = ((fd_failover_bus_msg_t const *)out_mem)->nonce;
   FD_TEST( next_nonce!=nonce );
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==idx );
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, next_nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, next_nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_LOG_NOTICE(( "pass: a silent failover tile completes the command as unresponsive" ));
@@ -326,10 +326,10 @@ test_bus_unresponsive( void ) {
 
 static ulong
 status_request( void ) {
-  fd_adminctl_failover_status_req_t req = { .version=FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION };
+  fd_adminctl_failover_req_t req = { .cmd=FD_ADMINCTL_FAILOVER_CMD_STATUS, .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION };
   void * payload;
-  ulong idx = request( FD_ADMINCTL_CMD_FAILOVER_STATUS, &req, sizeof(req), &payload );
-  failover_status( &ctx, stem, idx, payload, sizeof(req) );
+  ulong idx = request( FD_ADMINCTL_CMD_FAILOVER, &req, sizeof(req), &payload );
+  failover_request( &ctx, stem, idx, payload, sizeof(req) );
   return idx;
 }
 
@@ -343,18 +343,19 @@ test_status_abi( void ) {
   ctx.failov_out_idx    = ULONG_MAX;
   ctx.failov_in_idx     = ULONG_MAX;
   ev_init();
-  ulong versions[] = { 0UL, FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION, 2UL };
-  ulong sizes[]    = { 0UL, 7UL, 8UL, 9UL, 16UL, FD_ADMINCTL_PAYLOAD_MAX };
+  ulong versions[] = { 0UL, FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, 2UL };
+  ulong sizes[]    = { 0UL, 7UL, 8UL, 16UL, 23UL, 24UL, 25UL, FD_ADMINCTL_PAYLOAD_MAX };
   for( ulong v=0UL; v<sizeof(versions)/sizeof(versions[0]); v++ ) {
     for( ulong s=0UL; s<sizeof(sizes)/sizeof(sizes[0]); s++ ) {
       uchar data[ FD_ADMINCTL_PAYLOAD_MAX ] = {0};
       FD_STORE( ulong, data, versions[ v ] );
+      FD_STORE( ulong, data+8UL, FD_ADMINCTL_FAILOVER_CMD_STATUS );
       void * payload;
-      ulong idx = request( FD_ADMINCTL_CMD_FAILOVER_STATUS, data, sizes[ s ], &payload );
-      failover_status( &ctx, stem, idx, payload, sizes[ s ] );
+      ulong idx = request( FD_ADMINCTL_CMD_FAILOVER, data, sizes[ s ], &payload );
+      failover_request( &ctx, stem, idx, payload, sizes[ s ] );
       ulong expected = sizes[ s ]<8UL                                             ? FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH
-                     : versions[ v ]!=FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION ? FD_ADMINCTL_RESULT_ABI_VERSION_MISMATCH
-                     : sizes[ s ]!=8UL                                            ? FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH
+                     : versions[ v ]!=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION ? FD_ADMINCTL_RESULT_ABI_VERSION_MISMATCH
+                     : sizes[ s ]!=sizeof(fd_adminctl_failover_req_t)                                            ? FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH
                      :                                                              FD_ADMINCTL_RESULT_SUCCESS;
       int      expected_ev = expected==FD_ADMINCTL_RESULT_ABI_SIZE_MISMATCH    ? FD_EVENT_ADMIN_COMMAND_RESULT_ABI_SIZE_MISMATCH
                            : expected==FD_ADMINCTL_RESULT_ABI_VERSION_MISMATCH ? FD_EVENT_ADMIN_COMMAND_RESULT_ABI_VERSION_MISMATCH
@@ -362,9 +363,9 @@ test_status_abi( void ) {
       fd_adminctl_failover_status_resp_t got;
       ulong got_sz;
       FD_TEST( fd_adminctl_wait_response( ctx.adminctl, idx, &got, sizeof(got), &got_sz )==expected );
-      FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_STATUS, expected_ev ) );
+      FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, expected_ev ) );
       if( expected==FD_ADMINCTL_RESULT_SUCCESS ) {
-        FD_TEST( got_sz==sizeof(got) && got.version==FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION && !got.enabled );
+        FD_TEST( got_sz==sizeof(got) && got.version==FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION && !got.enabled );
         FD_TEST( got.promote_floor==ULONG_MAX );
       } else {
         FD_TEST( !got_sz );
@@ -374,7 +375,7 @@ test_status_abi( void ) {
 
   ctx.failover_enabled = 1;
   FD_TEST( fd_adminctl_wait( ctx.adminctl, status_request() )==FD_ADMINCTL_RESULT_UNSUPPORTED );
-  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_STATUS, FD_EVENT_ADMIN_COMMAND_RESULT_UNSUPPORTED ) );
+  FD_TEST( ev_was( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, FD_EVENT_ADMIN_COMMAND_RESULT_UNSUPPORTED ) );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 4UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 6UL ) )==FD_ADMINCTL_RESULT_UNKNOWN_COMMAND );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX && !pub_seq );
@@ -392,14 +393,14 @@ test_status_forwarding( void ) {
   ctx.failover_start_time = 0UL;
   ctx.failover_deadline   = 0L;
   ulong idx = status_request();
-  FD_TEST( ctx.failover_slot_idx==idx && ctx.failover_slot_cmd==FD_ADMINCTL_CMD_FAILOVER_STATUS && pub_seq==1UL );
+  FD_TEST( ctx.failover_slot_idx==idx && ctx.failover_slot_cmd==FD_ADMINCTL_FAILOVER_CMD_STATUS && pub_seq==1UL );
   FD_TEST( ctx.failover_start_time && ctx.failover_deadline>fd_tickcount() );
-  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_STATUS_REQ && pub_mcache[ 0 ].sz==sizeof(fd_failover_bus_msg_t) );
+  FD_TEST( pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_REQUEST && pub_mcache[ 0 ].sz==sizeof(fd_failover_bus_msg_t) );
   fd_failover_bus_msg_t const * sent = (fd_failover_bus_msg_t const *)out_mem;
-  fd_adminctl_failover_status_req_t fwd;
+  fd_adminctl_failover_req_t fwd;
   fd_memcpy( &fwd, sent->payload, sizeof(fwd) );
   ulong nonce = sent->nonce;
-  FD_TEST( nonce==ctx.failover_nonce && fwd.version==FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION );
+  FD_TEST( nonce==ctx.failover_nonce && fwd.version==FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION );
 
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_DEMOTE, 0UL ) )==FD_FAILOVER_CONTROL_RESULT_BUSY );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, status_request() )==FD_FAILOVER_CONTROL_RESULT_BUSY );
@@ -417,11 +418,11 @@ test_status_forwarding( void ) {
   answer.handoff_id     = 5001UL;
   answer.promote_floor  = 150UL;
   answer.promote_result = FD_FAILOVER_CONTROL_RESULT_PEER_ACTIVE;
-  failov_send( FD_FAILOVER_BUS_STATUS_RESP, nonce+1UL, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce+1UL, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==idx );
-  failov_send( FD_FAILOVER_BUS_STATUS_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 1 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 1 );
   FD_TEST( ctx.failover_slot_idx==idx );
-  failov_send( FD_FAILOVER_BUS_STATUS_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX );
 
   fd_adminctl_failover_status_resp_t got;
@@ -439,7 +440,7 @@ test_status_forwarding( void ) {
   after_credit( &ctx, stem, &poll_in, &busy );
   FD_TEST( fd_adminctl_wait_response( ctx.adminctl, idx, NULL, 0UL, &got_sz )==FD_FAILOVER_CONTROL_RESULT_UNRESPONSIVE );
   FD_TEST( !got_sz && ctx.failover_slot_idx==ULONG_MAX );
-  failov_send( FD_FAILOVER_BUS_STATUS_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( ctx.failover_slot_idx==ULONG_MAX );
   FD_LOG_NOTICE(( "pass: failover status forwards over the bus and shares the parked slot" ));
 }
@@ -455,8 +456,8 @@ test_bus_chunk( void ) {
 
   ulong idx = control( FD_ADMINCTL_FAILOVER_CMD_DEMOTE, 0UL );
   FD_TEST( pub_seq==1UL && pub_mcache[ 0 ].chunk==0U && ctx.failov_out_chunk==frame );
-  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION };
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, ctx.failover_nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION };
+  failov_send( FD_FAILOVER_BUS_RESPONSE, ctx.failover_nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_ADMINCTL_RESULT_SUCCESS );
 
   idx = status_request();
@@ -464,7 +465,7 @@ test_bus_chunk( void ) {
   FD_TEST( ((fd_failover_bus_msg_t const *)fd_chunk_to_laddr( out_mem, frame ))->nonce==ctx.failover_nonce );
   fd_adminctl_failover_status_resp_t status;
   fd_adminctl_failover_status_resp_init( &status );
-  failov_send( FD_FAILOVER_BUS_STATUS_RESP, ctx.failover_nonce, FD_ADMINCTL_RESULT_SUCCESS, &status, sizeof(status), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, ctx.failover_nonce, FD_ADMINCTL_RESULT_SUCCESS, &status, sizeof(status), 0 );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_ADMINCTL_RESULT_SUCCESS );
 
   /* The refused switch still answers, on the next frame. */
@@ -483,12 +484,12 @@ test_bus_chunk( void ) {
    after_credit goes out on the bus. */
 static void
 test_after_credit_dispatch( void ) {
-  ulong cmds[] = { FD_ADMINCTL_CMD_FAILOVER_CONTROL, FD_ADMINCTL_CMD_FAILOVER_STATUS };
-  ulong sigs[] = { FD_FAILOVER_BUS_CONTROL_REQ,      FD_FAILOVER_BUS_STATUS_REQ      };
+  ulong cmds[] = { FD_ADMINCTL_CMD_FAILOVER, FD_ADMINCTL_CMD_FAILOVER };
+  ulong sigs[] = { FD_FAILOVER_BUS_REQUEST,      FD_FAILOVER_BUS_REQUEST      };
   for( ulong c=0UL; c<2UL; c++ ) {
     bus_init();
-    fd_adminctl_failover_control_t    control_req = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION, .cmd=FD_ADMINCTL_FAILOVER_CMD_DEMOTE };
-    fd_adminctl_failover_status_req_t status_req  = { .version=FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION };
+    fd_adminctl_failover_req_t    control_req = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION, .cmd=FD_ADMINCTL_FAILOVER_CMD_DEMOTE };
+    fd_adminctl_failover_req_t status_req  = { .cmd=FD_ADMINCTL_FAILOVER_CMD_STATUS, .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION };
     void const * data = c ? (void const *)&status_req : (void const *)&control_req;
     ulong        sz   = c ? sizeof(status_req)        : sizeof(control_req);
     void * payload;
@@ -504,12 +505,12 @@ test_after_credit_dispatch( void ) {
       int busy    = 0;
       after_credit( &ctx, stem, &poll_in, &busy );
     }
-    FD_TEST( ctx.failover_slot_idx==idx && ctx.failover_slot_cmd==cmds[ c ] );
+    FD_TEST( ctx.failover_slot_idx==idx && ctx.failover_slot_cmd==(c ? FD_ADMINCTL_FAILOVER_CMD_STATUS : FD_ADMINCTL_FAILOVER_CMD_DEMOTE) );
     FD_TEST( pub_seq==1UL && pub_mcache[ 0 ].sig==sigs[ c ] );
 
     fd_adminctl_failover_status_resp_t answer;
     fd_adminctl_failover_status_resp_init( &answer );
-    failov_send( c ? FD_FAILOVER_BUS_STATUS_RESP : FD_FAILOVER_BUS_CONTROL_RESP, ctx.failover_nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+    failov_send( FD_FAILOVER_BUS_RESPONSE, ctx.failover_nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
     FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_ADMINCTL_RESULT_SUCCESS );
   }
   FD_LOG_NOTICE(( "pass: after_credit forwards polled failover commands and status" ));
@@ -523,7 +524,7 @@ test_bus_frame_bounds( void ) {
   if( !pid ) {
     bus_init();
     fd_log_level_stderr_set( 5 );
-    during_frag( &ctx, 0UL, 0UL, FD_FAILOVER_BUS_CONTROL_RESP, ctx.failov_in_wmark+1UL, sizeof(fd_failover_bus_msg_t), 0UL );
+    during_frag( &ctx, 0UL, 0UL, FD_FAILOVER_BUS_RESPONSE, ctx.failov_in_wmark+1UL, sizeof(fd_failover_bus_msg_t), 0UL );
     _exit( 0 );
   }
   int status;
@@ -597,11 +598,11 @@ test_events( void ) {
   ulong idx   = control( FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE );
   ulong nonce = ((fd_failover_bus_msg_t const *)out_mem)->nonce;
   FD_TEST( fd_adminctl_wait( ctx.adminctl, control( FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL ) )==FD_FAILOVER_CONTROL_RESULT_BUSY );
-  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, "busy", handoff ) );
-  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION };
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
+  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, "busy", handoff ) );
+  fd_adminctl_failover_control_resp_t answer = { .version=FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION };
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &answer, sizeof(answer), 0 );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, NULL, promote ) );
+  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, NULL, promote ) );
 
   idx = control( FD_ADMINCTL_FAILOVER_CMD_DEMOTE, 0UL );
   ctx.failover_deadline = fd_tickcount()-1L;
@@ -609,33 +610,31 @@ test_events( void ) {
   int busy    = 0;
   after_credit( &ctx, stem, &poll_in, &busy );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_FAILOVER_CONTROL_RESULT_UNRESPONSIVE );
-  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, "unresponsive", demote ) );
+  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, "unresponsive", demote ) );
 
   idx   = control( FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL );
   nonce = ((fd_failover_bus_msg_t const *)out_mem)->nonce;
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, 0x5001UL, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, 0x5001UL, &answer, sizeof(answer), 0 );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==0x5001UL );
-  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, "refused", handoff ) );
+  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, "refused", handoff ) );
 
   /* Each refusal of the failover tile has its own name. */
   idx   = control( FD_ADMINCTL_FAILOVER_CMD_HANDOFF, 0UL );
   nonce = ((fd_failover_bus_msg_t const *)out_mem)->nonce;
-  failov_send( FD_FAILOVER_BUS_CONTROL_RESP, nonce, FD_FAILOVER_CONTROL_RESULT_TAKEN, &answer, sizeof(answer), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_FAILOVER_CONTROL_RESULT_TAKEN, &answer, sizeof(answer), 0 );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_FAILOVER_CONTROL_RESULT_TAKEN );
-  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_CONTROL, "taken", handoff ) );
+  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, "taken", handoff ) );
   struct { ulong result; char const * name; } const names[] = {
     { FD_FAILOVER_CONTROL_RESULT_BUSY,            "busy"            },
     { FD_FAILOVER_CONTROL_RESULT_UNRESPONSIVE,    "unresponsive"    },
     { FD_FAILOVER_CONTROL_RESULT_BAD_ROLE,        "bad_role"        },
     { FD_FAILOVER_CONTROL_RESULT_IN_PROGRESS,     "in_progress"     },
-    { FD_FAILOVER_CONTROL_RESULT_NOT_PAIRED,      "not_paired"      },
     { FD_FAILOVER_CONTROL_RESULT_PEER_UNREADY,    "peer_unready"    },
     { FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED, "peer_unverified" },
     { FD_FAILOVER_CONTROL_RESULT_PEER_ACTIVE,     "peer_active"     },
     { FD_FAILOVER_CONTROL_RESULT_HANDOFF_PENDING, "handoff_pending" },
     { FD_FAILOVER_CONTROL_RESULT_TAKEN,           "taken"           },
     { FD_FAILOVER_CONTROL_RESULT_STAKED_SEEN,     "staked_seen"     },
-    { FD_FAILOVER_CONTROL_RESULT_NO_TOWER,        "no_tower"        },
     { FD_FAILOVER_CONTROL_RESULT_NO_FINAL_TOWER,  "no_final_tower"  },
     { 0x5001UL,                                   "refused"         },
   };
@@ -646,10 +645,10 @@ test_events( void ) {
   nonce = ((fd_failover_bus_msg_t const *)out_mem)->nonce;
   fd_adminctl_failover_status_resp_t status;
   fd_adminctl_failover_status_resp_init( &status );
-  failov_send( FD_FAILOVER_BUS_STATUS_RESP, nonce, FD_ADMINCTL_RESULT_SUCCESS, &status, sizeof(status), 0 );
+  failov_send( FD_FAILOVER_BUS_RESPONSE, nonce, FD_ADMINCTL_RESULT_SUCCESS, &status, sizeof(status), 0 );
   FD_TEST( fd_adminctl_wait( ctx.adminctl, idx )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ev->payload_size==sizeof(fd_adminctl_failover_status_req_t) && ev->start_time );
-  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER_STATUS, NULL, "{}" ) );
+  FD_TEST( ev->payload_size==sizeof(fd_adminctl_failover_req_t) && ev->start_time );
+  FD_TEST( ev_is( FD_EVENT_ADMIN_COMMAND_TYPE_FAILOVER, NULL, "{\"command\":\"status\"}" ) );
   fd_event_tl = NULL;
   FD_LOG_NOTICE(( "pass: failover command events name the command, flags and refusal" ));
 }
@@ -670,10 +669,10 @@ test_switch_request( void ) {
   fd_failover_switch_resp_t answer;
   fd_memcpy( &answer, out->payload, sizeof(answer) );
   FD_TEST( pub_seq==1UL && pub_mcache[ 0 ].sig==FD_FAILOVER_BUS_SWITCH_RESP );
-  FD_TEST( out->nonce==5UL && out->result==FD_FAILOVER_SWITCH_ERR_DISABLED && answer.result==FD_FAILOVER_SWITCH_ERR_DISABLED );
+  FD_TEST( out->nonce==5UL && answer.result==FD_FAILOVER_SWITCH_ERR_DISABLED );
   uchar before[ 32 ];
   fd_memset( before, 0x11, 32UL );
-  FD_TEST( fd_memeq( answer.identity, before, 32UL ) && fd_memeq( ctx.identity_pubkey, before, 32UL ) );
+  FD_TEST( fd_memeq( ctx.identity_pubkey, before, 32UL ) );
 
   topo_init();
   ctx.topo = &topo;
@@ -699,7 +698,7 @@ test_switch_request( void ) {
   FD_TEST( pub_seq==2UL && pub_mcache[ 1 ].sig==FD_FAILOVER_BUS_SWITCH_RESP );
   FD_TEST( out->nonce==6UL && out->result==FD_FAILOVER_SWITCH_OK && answer.result==FD_FAILOVER_SWITCH_OK );
   FD_TEST( answer.tower_watermark==4242UL );
-  FD_TEST( fd_memeq( answer.identity, req.identity, 32UL ) && fd_memeq( ctx.identity_pubkey, req.identity, 32UL ) );
+  FD_TEST( fd_memeq( ctx.identity_pubkey, req.identity, 32UL ) );
   for( ulong i=0UL; i<2UL; i++ ) {
     FD_TEST( sign_param[ i ]==FD_KEYSWITCH_PARAM_IDENTITY_PUBKEY );
     FD_TEST( fd_memeq( sign_bytes[ i ], req.identity, 32UL ) );

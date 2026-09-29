@@ -1,5 +1,5 @@
 /* Coverage retained from the persistent controller tests.  The
-   request now starts on the standby; the local safety rules still hold. */
+   request now starts on the standby, the local safety rules still hold. */
 
 static ulong
 pending_handoff_result( fd_failover_tile_ctx_t const * ctx,
@@ -16,7 +16,7 @@ test_request_guards( void ) {
   for( ulong variant=0UL; variant<8UL; variant++ ) {
     fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
     pair( ctx, 77UL, variant==3UL ? FD_FAILOVER_ROLE_ACTIVE : FD_FAILOVER_ROLE_STANDBY, 1000L );
-    if( variant ) make_tower( &ctx->cs, 99UL );
+    if( variant ) make_tower( &ctx->current_tower, 99UL );
     if( variant==1UL ) ctx->tower_gap = 1;
     if( variant==2UL ) ctx->last_vote_slot = 100UL;
     if( variant==4UL ) set_role( ctx, FD_FAILOVER_ROLE_STANDBY );
@@ -36,7 +36,7 @@ test_request_guards( void ) {
   }
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, 1000L );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   fd_failover_handoff_request_t request = { .handoff_id=42UL, .target_boot_id=OUR_BOOT_ID+1UL };
   deliver( ctx, FD_FAILOVER_MSG_HANDOFF_REQUEST, &request, sizeof(request) );
   FD_TEST( pending_handoff_result( ctx, 42UL )==FD_FAILOVER_CONTROL_RESULT_PEER_UNREADY );
@@ -123,7 +123,7 @@ stored_tower_ctx( void ) {
   FD_TEST( pending_rejected( ctx ).reason==FD_FAILOVER_REJECT_ADOPTION_FAILED );
   fd_failover_handoff_result_t result = { .handoff_id=42UL, .result=FD_FAILOVER_CONTROL_RESULT_PEER_UNREADY };
   deliver( ctx, FD_FAILOVER_MSG_HANDOFF_RESULT, &result, sizeof(result) );
-  FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE && !ctx->peer_tower.valid && !ctx->own_tower.valid && !ctx->request_id );
+  FD_TEST( ctx->action==FD_FAILOVER_ACTION_IDLE && !ctx->peer_tower.valid && !ctx->request_id );
   unpair( ctx );
   return ctx;
 }
@@ -133,7 +133,7 @@ test_stored_tower( void ) {
   long now = fd_failover_clock();
   fd_failover_tile_ctx_t * ctx = stored_tower_ctx();
   pair( ctx, 78UL, FD_FAILOVER_ROLE_STANDBY, now );
-  FD_TEST( !ctx->peer_tower.valid && !ctx->own_tower.valid && ctx->peer_floor==110UL );
+  FD_TEST( !ctx->peer_tower.valid && ctx->peer_floor==110UL );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, FD_ADMINCTL_FAILOVER_FLAG_YES|FD_ADMINCTL_FAILOVER_FLAG_FORCE, now )==FD_ADMINCTL_RESULT_SUCCESS );
   FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->promote_peer && !ctx->adopt.sz );
@@ -154,7 +154,7 @@ test_stored_tower( void ) {
   FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT );
   controller_fini( ctx );
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
-  make_tower( &ctx->own_tower, 99UL );
+  make_tower( &ctx->peer_tower, 99UL );
   ctx->root_slot = 99UL;
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
   controller_fini( ctx );
@@ -181,9 +181,10 @@ test_demoted_refusals( void ) {
   }
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   pair_demoter( ctx, 77UL, 1000L );
+  ctx->channel->paired_idx = 0;
   sz = demoted_payload( payload, 42UL, OUR_BOOT_ID+1UL, 99UL );
   deliver( ctx, FD_FAILOVER_MSG_DEMOTED, payload, sz );
-  FD_TEST( ctx->channel->metrics.wire_fatal_cnt==1UL && !ctx->peer_tower.valid );
+  FD_TEST( ctx->channel->state!=FD_FAILOVER_SESSION_PAIRED && !ctx->peer_tower.valid );
   FD_TEST( ctx->request_id==42UL && ctx->request_boot_id==77UL && !ctx->reply_valid );
   controller_fini( ctx );
   FD_LOG_NOTICE(( "pass: a bound DEMOTED cannot bypass role, busy, switch or target-boot checks" ));
@@ -254,7 +255,7 @@ test_promote_force_retained( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_ACTIVE, now );
   ctx->taken = 1;
-  ctx->taken_boot_id = 77UL;
+
   ctx->staked_seen_at = now;
   ctx->peer_floor = 150UL;
   ctx->replay_slot = 200UL;
@@ -269,13 +270,13 @@ test_promote_force_retained( void ) {
 
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, now );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   demote_through( ctx, 1 );
   ulong id = pending_demoted( ctx ).handoff_id;
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, 0UL, now )==FD_FAILOVER_CONTROL_RESULT_HANDOFF_PENDING );
   FD_TEST( ctx->action==FD_FAILOVER_ACTION_DEMOTE_WAIT_ACK && ctx->send_demoted && ctx->pending_valid );
   FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, yes|force, now )==FD_ADMINCTL_RESULT_SUCCESS );
-  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->own_tower.valid && !ctx->peer_tower.valid );
+  FD_TEST( ctx->promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && !ctx->peer_tower.valid );
   FD_TEST( !ctx->pending_valid && !ctx->send_demoted && ctx->handoff_result==FD_FAILOVER_HANDOFF_CANCELLED );
   deliver_ack( ctx, id );
   FD_TEST( ctx->handoff_result==FD_FAILOVER_HANDOFF_CANCELLED && !ctx->taken );
@@ -307,15 +308,15 @@ test_status_snapshot_retained( void ) {
   fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   ctx->port = (ushort)8010;
   status_snapshot( ctx, now, &status );
-  FD_TEST( status.version==FD_ADMINCTL_FAILOVER_STATUS_PAYLOAD_VERSION && status.enabled );
+  FD_TEST( status.version==FD_ADMINCTL_FAILOVER_PAYLOAD_VERSION && status.enabled );
   FD_TEST( status.role==FD_FAILOVER_ROLE_STANDBY && status.action==FD_FAILOVER_ACTION_IDLE && !status.stuck );
   FD_TEST( !status.peer_role_valid && !status.peer_boot_id && !status.peer_addr && status.peer_port==8010 );
   FD_TEST( !status.handoff_id && status.handoff_result==FD_FAILOVER_HANDOFF_NONE );
   FD_TEST( status.promote_source==FD_FAILOVER_SOURCE_VOTE_ACCOUNT && status.promote_floor==FD_FAILOVER_SLOT_NULL );
   FD_TEST( status.promote_result==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
-  make_tower( &ctx->own_tower, 99UL );
+  make_tower( &ctx->peer_tower, 99UL );
   status_snapshot( ctx, now, &status );
-  FD_TEST( status.promote_source==FD_FAILOVER_SOURCE_OWN && status.promote_result==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
+  FD_TEST( status.promote_source==FD_FAILOVER_SOURCE_PEER && status.promote_result==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
   fd_memcpy( ctx->gossip_origin, ctx->hello.staked_pubkey, 32UL );
   ctx->gossip_socket.addr = FD_IP4_ADDR(10,0,0,9);
   ctx->gossip_socket.port = ctx->own_gossip.port;
@@ -344,7 +345,7 @@ test_status_snapshot_retained( void ) {
 
   ctx = controller_init( FD_FAILOVER_ROLE_ACTIVE );
   pair( ctx, 77UL, FD_FAILOVER_ROLE_STANDBY, now );
-  make_tower( &ctx->cs, 99UL );
+  make_tower( &ctx->current_tower, 99UL );
   demote_through( ctx, 1 );
   status_snapshot( ctx, now, &status );
   FD_TEST( status.role==FD_FAILOVER_ROLE_STANDBY && status.action==FD_FAILOVER_ACTION_DEMOTE_WAIT_ACK );
@@ -366,7 +367,7 @@ test_holder_recheck( void ) {
   for( int force=0; force<2; force++ ) for( int drop=0; drop<2; drop++ ) {
     fd_failover_tile_ctx_t * ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
     ulong flags = FD_ADMINCTL_FAILOVER_FLAG_YES | (force ? FD_ADMINCTL_FAILOVER_FLAG_FORCE : 0UL);
-    if( !force && FD_FAILOVER_ON_DEMAND ) {
+    if( !force ) {
       FD_TEST( control( ctx, FD_ADMINCTL_FAILOVER_CMD_PROMOTE, flags, now )==FD_FAILOVER_CONTROL_RESULT_PEER_UNVERIFIED );
       /* Preserve the final guard's independent test even though the on-demand
          operator API can no longer enter this unfenced path. */
@@ -455,7 +456,7 @@ test_status_peer_evidence( void ) {
   /* TAKEN is a durable recovery guard, not the role of a later boot. */
   ctx = controller_init( FD_FAILOVER_ROLE_STANDBY );
   ctx->taken = 1;
-  ctx->taken_boot_id = 77UL;
+
   pair( ctx, 78UL, FD_FAILOVER_ROLE_STANDBY, now );
   status_snapshot( ctx, now, &status );
   FD_TEST( status.peer_role_valid && status.peer_role==FD_FAILOVER_ROLE_STANDBY && status.peer_boot_id==78UL );

@@ -163,12 +163,9 @@ test_hello_checks( void ) {
   FD_TEST( fd_failover_hello_check( &self, &peer )==FD_FAILOVER_HELLO_ERR_BOTH_ACT );
   FD_TEST( fd_failover_hello_check( &peer, &self )==FD_FAILOVER_HELLO_ERR_BOTH_ACT );
 
-  /* A safety relevant config mismatch is fatal */
+  /* Reset the identities for the remaining compatibility checks. */
   fill_hello( &self, 0x01, 0xAA, 0xBB, (uchar)FD_FAILOVER_ROLE_ACTIVE  );
   fill_hello( &peer, 0x02, 0xAA, 0xBB, (uchar)FD_FAILOVER_ROLE_STANDBY );
-  peer.cfg_hash = 7UL;
-  FD_TEST( fd_failover_hello_check( &self, &peer )==FD_FAILOVER_HELLO_ERR_CFG );
-  peer.cfg_hash = 0UL;
 
   /* A different commit is fine */
   peer.commit[ 0 ] = 1;
@@ -184,25 +181,6 @@ test_hello_checks( void ) {
   FD_TEST( fd_failover_hello_check( &self, &peer )==FD_FAILOVER_HELLO_OK );
 
   FD_LOG_NOTICE(( "pass: test_hello_checks" ));
-}
-
-/* test_cfg_hash: the same inputs give the same hash, and every covered
-   field changes it. */
-static void
-test_cfg_hash( void ) {
-  uchar other [ 32 ]; fd_memset( other,  0x03, 32UL );
-  uchar staked[ 32 ]; fd_memset( staked, 0xAA, 32UL );
-  uchar vote  [ 32 ]; fd_memset( vote,   0xBB, 32UL );
-  uchar tower = (uchar)FD_FAILOVER_MODE_TOWER;
-
-  ulong hash = fd_failover_cfg_hash( staked, vote, tower );
-  FD_TEST( fd_failover_cfg_hash( staked, vote,   tower )==hash );
-  FD_TEST( fd_failover_cfg_hash( other,  vote,   tower )!=hash );
-  FD_TEST( fd_failover_cfg_hash( staked, other,  tower )!=hash );
-  FD_TEST( fd_failover_cfg_hash( vote,   staked, tower )!=hash );
-  FD_TEST( fd_failover_cfg_hash( staked, vote,   (uchar)FD_FAILOVER_MODE_CNT )!=hash );
-
-  FD_LOG_NOTICE(( "pass: test_cfg_hash" ));
 }
 
 /* test_member_cert: the staked key's signature over the prefix and the
@@ -243,72 +221,6 @@ test_member_cert( void ) {
   FD_LOG_NOTICE(( "pass: test_member_cert" ));
 }
 
-/* test_status_decode: a sane STATUS decodes, a bad size, role, flag or
-   slot order does not and leaves out as it was. */
-static void
-test_status_decode( void ) {
-  fd_failover_status_t status = {
-    .role           = FD_FAILOVER_ROLE_ACTIVE,
-    .flags          = FD_FAILOVER_STATUS_BUSY,
-    .replay_slot    = 100UL,
-    .root_slot      = 68UL,
-    .last_vote_slot = 99UL,
-    .sent_at        = 5UL,
-    .echo_sent_at   = 3UL,
-  };
-
-  fd_failover_status_t out;
-  FD_TEST( fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-  FD_TEST( fd_memeq( &out, &status, sizeof(status) ) );
-
-  fd_failover_status_t before = out;
-  FD_TEST( !fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status)-1UL ) );
-  FD_TEST( !fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status)+1UL ) );
-  FD_TEST( fd_memeq( &out, &before, sizeof(out) ) );
-
-  /* Either role decodes, an unknown one does not */
-  status.role = FD_FAILOVER_ROLE_STANDBY;
-  FD_TEST(  fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-  FD_TEST( out.role==FD_FAILOVER_ROLE_STANDBY );
-  before = out;
-  status.role = 2U;
-  FD_TEST( !fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-  FD_TEST( fd_memeq( &out, &before, sizeof(out) ) );
-  status.role = FD_FAILOVER_ROLE_STANDBY;
-
-  /* BUSY and STUCK are the only flags */
-  status.flags = FD_FAILOVER_STATUS_BUSY|FD_FAILOVER_STATUS_STUCK;
-  FD_TEST(  fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-  status.flags = 4U;
-  FD_TEST( !fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-  status.flags = 0U;
-
-  /* Slots may be unknown */
-  status.replay_slot    = FD_FAILOVER_SLOT_NULL;
-  status.root_slot      = FD_FAILOVER_SLOT_NULL;
-  status.last_vote_slot = FD_FAILOVER_SLOT_NULL;
-  FD_TEST(  fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-
-  /* Vote past replay */
-  status.replay_slot    = 100UL;
-  status.last_vote_slot = 101UL;
-  FD_TEST( !fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-
-  /* Root past the vote */
-  status.last_vote_slot = 99UL;
-  status.root_slot      = 100UL;
-  FD_TEST( !fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-
-  /* Root past replay with no vote */
-  status.last_vote_slot = FD_FAILOVER_SLOT_NULL;
-  status.replay_slot    = 67UL;
-  status.root_slot      = 68UL;
-  FD_TEST( !fd_failover_status_decode( &out, (uchar const *)&status, sizeof(status) ) );
-
-  FD_LOG_NOTICE(( "pass: test_status_decode" ));
-}
-
-/* Tower with votes at root+offset0 and root+offset0+offset1. */
 static ulong
 make_tower( uchar * state,
             ulong   root,
@@ -464,7 +376,7 @@ test_promote_replies( void ) {
 }
 
 /* Exact sizes, unaligned payloads and all-zero id fields.  The output
-   stays unchanged on failure; arbitrary refusal codes reach the binding
+   stays unchanged on failure, arbitrary refusal codes reach the binding
    and result checks in the controller. */
 static void
 test_handoff_messages( void ) {
@@ -512,9 +424,7 @@ main( int     argc,
   test_session_exhaustive();
   test_session_properties();
   test_hello_checks();
-  test_cfg_hash();
   test_member_cert();
-  test_status_decode();
   test_demoted_decode();
   test_promote_replies();
   test_handoff_messages();

@@ -123,7 +123,7 @@ test_seccomp( void ) {
         poll_channel( ch );
       }
       if( dial ) {
-        if( fd_failover_channel_send( ch, now, FD_FAILOVER_MSG_STATUS, (uchar const *)"test", 4UL ) ) __builtin_trap();
+        if( fd_failover_channel_send( ch, now, FD_FAILOVER_MSG_HANDOFF_REQUEST, (uchar const *)"test", 4UL ) ) __builtin_trap();
         while( progress[ 0 ]<=round ) {
           now = fd_log_wallclock();
           if( now>=deadline ) __builtin_trap();
@@ -173,8 +173,7 @@ pump( fd_failover_channel_t * a,
     now += 100000L;
     fd_log_sleep( 100000L );
   }
-  FD_LOG_ERR(( "pairing timed out: states %lu %lu, TLS failures %lu %lu", a->state, b->state,
-               a->metrics.tls_fail_cnt, b->metrics.tls_fail_cnt ));
+  FD_LOG_ERR(( "pairing timed out: states %lu %lu", a->state, b->state ));
 }
 
 static int
@@ -196,14 +195,14 @@ transfer( fd_failover_channel_t * a,
           ulong                   sz ) {
   static uchar data[ FD_FAILOVER_PAYLOAD_MAX ];
   for( ulong i=0; i<sz; i++ ) data[i] = (uchar)i;
-  FD_TEST( !fd_failover_channel_send( b, now, FD_FAILOVER_MSG_STATUS, data, sz ) );
+  FD_TEST( !fd_failover_channel_send( b, now, FD_FAILOVER_MSG_HANDOFF_REQUEST, data, sz ) );
   for( ulong i=0; i<10000UL; i++ ) {
     int busy = 0;
     ushort type;
     ulong got;
     poll_channel( b );
     if( fd_failover_channel_poll( a, now, &busy, &type, payload_buf, &got ) ) {
-      FD_TEST( type==FD_FAILOVER_MSG_STATUS && got==sz && fd_memeq( data, payload_buf, sz ) );
+      FD_TEST( type==FD_FAILOVER_MSG_HANDOFF_REQUEST && got==sz && fd_memeq( data, payload_buf, sz ) );
       return;
     }
     now += 100000L;
@@ -251,26 +250,15 @@ test_admission_buckets( void ) {
   FD_TEST( !admit( ch, 8U, tick ) );
   FD_TEST(  admit( ch, 7U, tick ) );
 
-  /* A burst cannot become a burst of diagnostics.  Real categories
-     have independent limits, and suppressed counts survive until the
-     next permitted line, including at the exact timer boundary. */
-  ulong suppressed = ULONG_MAX;
-  FD_TEST( fd_failover_log_take( &ch->dial_log[0], tick, &suppressed ) && !suppressed );
-  for( ulong i=0; i<100000UL; i++ ) FD_TEST( !fd_failover_log_take( &ch->dial_log[0], tick+(long)i, &suppressed ) );
-  FD_TEST( !fd_failover_log_take( &ch->dial_log[0], tick-1L, &suppressed ) );
-  FD_TEST( !fd_failover_log_take( &ch->dial_log[0], tick+59999999999L, &suppressed ) );
-  FD_TEST( fd_failover_log_take( &ch->dial_log[0], tick+60000000000L, &suppressed ) && suppressed==100002UL );
-  FD_TEST( ch->dial_log[0].count==100004UL && !ch->dial_log[0].suppressed );
-  FD_TEST( fd_failover_log_take( &ch->hello_log[FD_FAILOVER_HELLO_ERR_BOTH_ACT], tick, &suppressed ) && !suppressed );
-  FD_TEST( fd_failover_log_take( &ch->hello_log[FD_FAILOVER_HELLO_ERR_CERT], tick, &suppressed ) && !suppressed );
   FD_TEST( tls_log_kind( FD_TLS_REASON_ALPN_NEG )!=tls_log_kind( FD_TLS_REASON_ED25519_FAIL ) );
   FD_TEST( tls_log_kind( 0U )!=tls_log_kind( FD_TLS_REASON_ALPN_NEG ) );
-  /* Saturating counts and a monotonic clock near its upper bound never
-     wrap the quota back into a fresh first occurrence. */
-  fd_failover_log_t limit = { .at=LONG_MAX-5L, .count=ULONG_MAX, .suppressed=ULONG_MAX };
-  FD_TEST( !fd_failover_log_take( &limit, LONG_MAX, &suppressed ) );
-  FD_TEST( limit.count==ULONG_MAX && limit.suppressed==ULONG_MAX );
   FD_LOG_NOTICE(( "pass: global token refill, burst cap, backwards clock and source table reuse" ));
+}
+
+static int
+tls_refused( fd_failover_channel_t const * ch ) {
+  for( ulong i=0UL; i<4UL; i++ ) if( ch->tls_log_at[i] ) return 1;
+  return 0;
 }
 
 static void
@@ -279,7 +267,7 @@ test_tls_profile( fd_failover_channel_t * a,
                   ushort                  port ) {
   /* A legacy ClientHello with TLS 1.2 record and handshake versions,
      one cipher suite and no extensions, so no supported_versions.
-     fd_tls speaks TLS 1.3 only and answers it with protocol_version. */
+     fd_tls speaks TLS 1.3 only and rejects it with protocol_version. */
   static uchar const legacy_hello[] = {
     0x16, 0x03, 0x01, 0x00, 0x2f,             /* handshake record, 47 bytes    */
     0x01, 0x00, 0x00, 0x2b,                   /* ClientHello, 43 bytes         */
@@ -318,9 +306,9 @@ test_tls_profile( fd_failover_channel_t * a,
       case 2U: tls.conn.tls.alpn_sz = 0UL; break;
       case 3U: tls.conn.tls.cert_x509_sz = 0UL; break;
     }
-    ulong failures = a->metrics.tls_fail_cnt;
-    ulong pairings = a->metrics.paired_cnt;
-    for( ulong i=0UL; i<10000UL && a->metrics.tls_fail_cnt==failures; i++ ) {
+    fd_memset( a->tls_log_at, 0, sizeof(a->tls_log_at) );
+    ulong pairings = fd_failover_channel_generation( a );
+    for( ulong i=0UL; i<10000UL && !tls_refused( a ); i++ ) {
       if( !failed ) {
         fd_failover_tls_budget( &tls );
         failed = fd_failover_tls_handshake( &tls )<0;
@@ -330,14 +318,14 @@ test_tls_profile( fd_failover_channel_t * a,
       now += 100000L;
       fd_log_sleep( 100000L );
     }
-    FD_TEST( a->metrics.tls_fail_cnt==failures+1UL && a->metrics.paired_cnt==pairings );
+    FD_TEST( tls_refused( a ) && fd_failover_channel_generation( a )==pairings );
     FD_TEST( !fd_failover_channel_pending( a ) && a->state==FD_FAILOVER_SESSION_LISTENING );
     FD_TEST( fd_memeq( &a->peer_hello, &(fd_failover_hello_t){0}, sizeof(a->peer_hello) ) );
     fd_failover_tls_fini( &tls );
     FD_TEST( !close( fd ) );
     now += 2000000001L;
     pump( a, b );
-    FD_TEST( a->metrics.paired_cnt==pairings+1UL );
+    FD_TEST( fd_failover_channel_generation( a )==pairings+1UL );
     transfer( a, b, 70UL );
   }
   FD_LOG_NOTICE(( "pass: TLS 1.2, wrong or missing ALPN, and missing client certificate are rejected" ));
@@ -356,21 +344,19 @@ test_disconnects( fd_failover_channel_t * a,
     FD_TEST( fd_failover_channel_pending( a )==1UL );
     struct linger linger = { .l_onoff=1, .l_linger=0 };
     if( rst ) FD_TEST( !setsockopt( fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger) ) );
-    ulong failures = a->metrics.tls_fail_cnt;
     FD_TEST( !close( fd ) );
     for( ulong i=0UL; i<10000UL && fd_failover_channel_pending( a ); i++ ) {
       poll_channel( a );
       now += 100000L;
       fd_log_sleep( 100000L );
     }
-    FD_TEST( !fd_failover_channel_pending( a ) && a->metrics.tls_fail_cnt==failures+1UL );
+    FD_TEST( !fd_failover_channel_pending( a ) && !paired( a ) );
     now += 2000000001L;
     pump( a, b );
     transfer( a, b, 70UL );
-    fd = b->candidates[b->active].fd;
+    fd = b->candidates[b->paired_idx].fd;
     if( rst ) FD_TEST( !setsockopt( fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger) ) );
-    failures = a->metrics.tls_fail_cnt;
-    ulong pairings = a->metrics.paired_cnt;
+    ulong pairings = fd_failover_channel_generation( a );
     fd_failover_channel_hangup( b, now );
     for( ulong i=0UL; i<10000UL && paired( a ); i++ ) {
       poll_channel( a );
@@ -378,11 +364,11 @@ test_disconnects( fd_failover_channel_t * a,
       fd_log_sleep( 100000L );
     }
     FD_TEST( a->state==FD_FAILOVER_SESSION_LISTENING );
-    FD_TEST( a->metrics.tls_fail_cnt==failures && a->metrics.paired_cnt==pairings );
+    FD_TEST( fd_failover_channel_generation( a )==pairings );
     FD_TEST( fd_memeq( &a->peer_hello, &(fd_failover_hello_t){0}, sizeof(a->peer_hello) ) );
     now += 2000000001L;
     pump( a, b );
-    FD_TEST( a->metrics.paired_cnt==pairings+1UL );
+    FD_TEST( fd_failover_channel_generation( a )==pairings+1UL );
     transfer( b, a, FD_FAILOVER_PAYLOAD_MAX );
   }
   FD_LOG_NOTICE(( "pass: handshake and paired TCP EOF/reset permit clean reconnect" ));
@@ -454,9 +440,9 @@ test_silence( fd_failover_channel_t * a,
 
   /* b stops reading, so our frames back up until the socket is full. */
   static uchar       data[ FD_FAILOVER_PAYLOAD_MAX ];
-  struct candidate * c = &a->candidates[ a->active ];
+  struct candidate * c = &a->candidates[ a->paired_idx ];
   for( ulong i=0UL; i<100000UL && !fd_tlsrec_sock_tx_pending( &c->tls.sock ); i++ ) {
-    if( !fd_failover_channel_tx_pending( a ) ) FD_TEST( !fd_failover_channel_send( a, now, FD_FAILOVER_MSG_STATUS, data, sizeof(data) ) );
+    if( !fd_failover_channel_tx_pending( a ) ) FD_TEST( !fd_failover_channel_send( a, now, FD_FAILOVER_MSG_HANDOFF_REQUEST, data, sizeof(data) ) );
     poll_channel( a );
   }
   FD_TEST( fd_tlsrec_sock_tx_pending( &c->tls.sock ) );
@@ -474,7 +460,7 @@ test_silence( fd_failover_channel_t * a,
 static void
 test_ciphertext_drain( fd_failover_channel_t * a,
                        fd_failover_channel_t * b ) {
-  struct candidate * c = &a->candidates[ a->active ];
+  struct candidate * c = &a->candidates[ a->paired_idx ];
   int sndbuf = 4096;
   FD_TEST( !setsockopt( c->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf) ) );
   uchar payload[1024];
@@ -517,27 +503,34 @@ test_ciphertext_drain( fd_failover_channel_t * a,
 static void
 test_loss_log_causes( fd_failover_channel_t * a,
                       fd_failover_channel_t * b ) {
-  fd_memset( a->loss_log, 0, sizeof(a->loss_log) );
+  fd_memset( a->loss_log_at, 0, sizeof(a->loss_log_at) );
   pump( a, b );
   a->expected_close = 0;
   fd_failover_channel_hangup( b, now );
   for( ulong i=0; i<10000UL && paired( a ); i++ ) {
     poll_channel( a ); now+=100000L; fd_log_sleep( 100000L );
   }
-  FD_TEST( !paired( a ) && a->loss_log[LOSS_TRANSPORT].count==1UL );
-  for( ulong i=1UL; i<=2UL; i++ ) {
+  long transport_at = a->loss_log_at[LOSS_TRANSPORT];
+  FD_TEST( !paired( a ) && transport_at>now );
+  long protocol_at = 0L;
+  for( ulong i=0UL; i<2UL; i++ ) {
     fd_failover_channel_hangup( b, now );
     now += 2000000001L;
     pump( a, b );
     fd_failover_channel_protocol_error( a, now );
-    FD_TEST( a->loss_log[LOSS_PROTOCOL].count==i );
-    FD_TEST( a->loss_log[LOSS_PROTOCOL].suppressed==i-1UL );
-    FD_TEST( a->loss_log[LOSS_TRANSPORT].count==1UL );
+    if( !i ) protocol_at = now+60000000000L;
+    FD_TEST( !paired( a ) && a->loss_log_at[LOSS_PROTOCOL]==protocol_at );
+    FD_TEST( a->loss_log_at[LOSS_TRANSPORT]==transport_at );
   }
+  fd_failover_channel_hangup( b, now );
+  now = protocol_at;
+  pump( a, b );
+  fd_failover_channel_protocol_error( a, now );
+  FD_TEST( a->loss_log_at[LOSS_PROTOCOL]==now+60000000000L );
   fd_failover_channel_hangup( b, now );
   now += 2000000001L;
   pump( a, b );
-  FD_LOG_NOTICE(( "pass: transport loss cannot suppress a new protocol cause, repeated protocol failures coalesce" ));
+  FD_LOG_NOTICE(( "pass: diagnostic categories have independent deadlines and repeat only after their limit" ));
 }
 
 /* An orderly peer close after a drained RESULT is routine for on-demand connections.
@@ -563,22 +556,22 @@ test_result_close( fd_failover_channel_t * a,
       fd_log_sleep( 100000L );
     }
     FD_TEST( received && !fd_failover_channel_tx_pending( a ) );
-    ulong warnings = a->loss_log[corrupt ? LOSS_TLS : LOSS_TRANSPORT].count;
+    a->loss_log_at[corrupt ? LOSS_TLS : LOSS_TRANSPORT] = 0L;
     if( corrupt ) {
       /* A complete application-data record with an invalid AEAD tag. */
       uchar bad[22] = {23,3,3,0,17};
-      FD_TEST( send( b->candidates[b->active].fd, bad, sizeof(bad), MSG_NOSIGNAL )==(long)sizeof(bad) );
+      FD_TEST( send( b->candidates[b->paired_idx].fd, bad, sizeof(bad), MSG_NOSIGNAL )==(long)sizeof(bad) );
     } else fd_failover_channel_hangup( b, now );
     for( ulong i=0; i<10000UL && paired( a ); i++ ) {
       poll_channel( a ); now+=100000L; fd_log_sleep( 100000L );
     }
     FD_TEST( !paired( a ) );
-    FD_TEST( a->loss_log[corrupt ? LOSS_TLS : LOSS_TRANSPORT].count==warnings+(ulong)(corrupt || !FD_FAILOVER_ON_DEMAND) );
+    FD_TEST( corrupt ? a->loss_log_at[LOSS_TLS]>now : !a->loss_log_at[LOSS_TRANSPORT] );
     fd_failover_channel_hangup( b, now );
     now += 2000000001L;
   }
   pump( a, b );
-  FD_LOG_NOTICE(( "pass: normal RESULT close is quiet only on demand, corrupted TLS after RESULT remains visible" ));
+  FD_LOG_NOTICE(( "pass: normal RESULT close is quiet, corrupted TLS after RESULT remains visible" ));
 }
 
 static void
@@ -607,10 +600,8 @@ test_fd_exhaustion( fd_failover_channel_t * a,
       held[cnt++] = fd;
     }
     FD_TEST( cnt );
-    ulong starts = a->metrics.connection_attempt_cnt;
     poll_channel( a );
     FD_TEST( a->state==FD_FAILOVER_SESSION_LISTENING && !fd_failover_channel_pending( a ) );
-    FD_TEST( a->metrics.connection_attempt_cnt==starts );
     poll_channel( b );
     FD_TEST( b->state==FD_FAILOVER_SESSION_BACKOFF && !fd_failover_channel_pending( b ) );
     FD_TEST( b->retry_at>now );
@@ -697,7 +688,6 @@ main( int     argc,
   /* Without a member certificate we neither accept nor dial. */
   int early = raw_connect( port, FD_IP4_ADDR(127,0,0,2) );
   for( ulong i=0; i<100UL; i++ ) { poll_channel( a ); poll_channel( b ); now += 1000000L; }
-  FD_TEST( !a->metrics.connection_attempt_cnt && !b->metrics.connection_attempt_cnt );
   FD_TEST( !paired( a ) && !paired( b ) && !fd_failover_channel_pending( a ) && !fd_failover_channel_pending( b ) );
   FD_TEST( b->state==FD_FAILOVER_SESSION_BACKOFF );
   member_cert( cert, key_a, key_s );
@@ -706,7 +696,7 @@ main( int     argc,
   FD_TEST( !fd_failover_channel_set_member_cert( b, cert ) );
   FD_TEST( fd_memeq( b->self_hello.member_cert, cert, 64UL ) );
   poll_channel( a );
-  FD_TEST( a->metrics.connection_attempt_cnt==1UL && fd_failover_channel_pending( a )==1UL );
+  FD_TEST( fd_failover_channel_pending( a )==1UL );
   close( early );
   FD_LOG_NOTICE(( "pass: nothing starts before the member certificate" ));
 
@@ -714,10 +704,9 @@ main( int     argc,
   fd_failover_channel_hangup( b, now );
   fd_failover_channel_init_dialer( b, 0U, port );
   FD_TEST( b->state==FD_FAILOVER_SESSION_LISTENING && !b->dial_peer );
-  ulong starts = b->metrics.connection_attempt_cnt;
   for( ulong i=0; i<100UL; i++ ) { poll_channel( b ); now += 1000000L; }
   FD_TEST( b->state==FD_FAILOVER_SESSION_LISTENING && !fd_failover_channel_pending( b ) );
-  FD_TEST( b->metrics.connection_attempt_cnt==starts );
+  FD_TEST( !fd_failover_channel_pending( b ) );
   fd_failover_channel_init_dialer( b, FD_IP4_ADDR(127,0,0,1), port );
   FD_TEST( b->state==FD_FAILOVER_SESSION_BACKOFF && b->dial_peer && !b->retry_at );
   FD_LOG_NOTICE(( "pass: no dial before the active's address is known" ));
@@ -735,13 +724,14 @@ main( int     argc,
       member_cert( c->self_hello.member_cert, key_c, key_c );
     }
     c->member_cert_set = 1;
-    ulong rejects  = a->metrics.hello_reject_cnt;
-    ulong received = c->metrics.frames_received;
-    for( ulong i=0; i<1000UL && a->metrics.hello_reject_cnt==rejects; i++ ) { poll_channel( c ); poll_channel( a ); now += 1000000L; fd_log_sleep( 100000L ); }
-    FD_TEST( a->metrics.hello_reject_cnt>rejects && !paired( a ) );
+    ulong bucket = variant ? 12UL : FD_FAILOVER_HELLO_ERR_CERT;
+    a->hello_log_at[bucket] = 0L;
+    for( ulong i=0; i<1000UL && !a->hello_log_at[bucket]; i++ ) { poll_channel( c ); poll_channel( a ); now += 1000000L; fd_log_sleep( 100000L ); }
+    FD_TEST( a->hello_log_at[bucket]>now && !paired( a ) );
     FD_TEST( fd_memeq( &a->peer_hello, &(fd_failover_hello_t){0}, sizeof(ha) ) );
     for( ulong i=0; i<100UL; i++ ) { poll_channel( c ); fd_log_sleep( 100000L ); }
-    FD_TEST( c->metrics.frames_received==received && !paired( c ) );
+    FD_TEST( !fd_failover_channel_generation( c ) && !paired( c ) );
+    FD_TEST( fd_memeq( &c->peer_hello, &(fd_failover_hello_t){0}, sizeof(c->peer_hello) ) );
     fd_failover_channel_hangup( c, now );
   }
   fd_failover_channel_init_dialer( c, 0U, 0 );
@@ -756,24 +746,22 @@ main( int     argc,
   FD_TEST( fd_failover_channel_pending( a )==1UL );
   pump( a, b );
   FD_TEST( !fd_failover_channel_pending( a ) );
-  FD_TEST( a->metrics.paired_cnt==1UL && b->metrics.paired_cnt==1UL );
+  FD_TEST( fd_failover_channel_generation( a )==1UL && fd_failover_channel_generation( b )==1UL );
   close( slow );
-  transfer( a, b, sizeof(fd_failover_status_t) );
+  transfer( a, b, sizeof(fd_failover_handoff_request_t) );
   transfer( b, a, FD_FAILOVER_PAYLOAD_MAX );
   FD_LOG_NOTICE(( "pass: concurrent slow handshake, mutual TLS and bounded large-frame I/O" ));
 
   /* An established connection is not displaced by a connection flood. */
-  starts = a->metrics.connection_attempt_cnt;
-  ulong admissions = a->metrics.admission_drop_cnt;
+  int paired_fd = a->candidates[ a->paired_idx ].fd;
   for( ulong i=0; i<128UL; i++ ) {
     int attacker = raw_connect( port, FD_IP4_ADDR(127,0,0,2) );
     poll_channel( a );
     close( attacker );
     FD_TEST( paired( a ) && paired( b ) && !fd_failover_channel_pending( a ) );
   }
-  FD_TEST( a->metrics.connection_attempt_cnt==starts );
-  FD_TEST( a->metrics.admission_drop_cnt==admissions+128UL );
-  FD_TEST( a->metrics.paired_cnt==1UL && b->metrics.paired_cnt==1UL );
+  FD_TEST( a->candidates[ a->paired_idx ].fd==paired_fd );
+  FD_TEST( fd_failover_channel_generation( a )==1UL && fd_failover_channel_generation( b )==1UL );
   transfer( a, b, 70UL );
   FD_LOG_NOTICE(( "pass: established session survives connection flood" ));
 
@@ -790,7 +778,7 @@ main( int     argc,
   poll_channel( a ); poll_channel( b );
   FD_TEST( paired( a ) && paired( b ) );
   transfer( b, a, 70UL );
-  FD_TEST( a->metrics.paired_cnt==1UL && b->metrics.paired_cnt==1UL );
+  FD_TEST( fd_failover_channel_generation( a )==1UL && fd_failover_channel_generation( b )==1UL );
   FD_LOG_NOTICE(( "pass: a paired session survives role changes and a new dial address" ));
 
   /* Only an armed operation dials.  Ending it disables retries even
@@ -801,9 +789,8 @@ main( int     argc,
   fd_failover_channel_hangup( b, now );
   FD_TEST( b->state==FD_FAILOVER_SESSION_LISTENING && !b->dial_peer );
   now += 2000000001L;
-  starts = b->metrics.connection_attempt_cnt;
   for( ulong i=0; i<100UL; i++ ) { poll_channel( a ); poll_channel( b ); now += 1000000L; }
-  FD_TEST( b->metrics.connection_attempt_cnt==starts && !paired( a ) && !paired( b ) );
+  FD_TEST( !fd_failover_channel_pending( b ) && !paired( a ) && !paired( b ) );
   fd_failover_channel_set_role( b, FD_FAILOVER_ROLE_STANDBY );
   fd_failover_channel_init_dialer( b, FD_IP4_ADDR(127,0,0,1), port );
   FD_TEST( b->state==FD_FAILOVER_SESSION_BACKOFF && b->dial_peer && !b->retry_at );
@@ -820,9 +807,8 @@ main( int     argc,
   fd_failover_channel_hangup( b, now );
   now += 2000000001L;
   fd_failover_channel_init_dialer( b, FD_IP4_ADDR(127,0,0,1), dead );
-  starts = b->metrics.connection_attempt_cnt;
   poll_channel( b );
-  FD_TEST( b->metrics.connection_attempt_cnt==starts+1UL && fd_failover_channel_pending( b )==1UL );
+  FD_TEST( b->state!=FD_FAILOVER_SESSION_LISTENING && fd_failover_channel_pending( b )==1UL );
   fd_failover_channel_init_dialer( b, FD_IP4_ADDR(127,0,0,1), port );
   FD_TEST( b->state==FD_FAILOVER_SESSION_BACKOFF && !fd_failover_channel_pending( b ) && !b->retry_at );
   pump( a, b );
@@ -856,7 +842,6 @@ main( int     argc,
   FD_TEST( !b->dial_peer && c->dial_peer && !fd_failover_channel_pending( b ) );
   FD_TEST( fd_memeq( b->peer_hello.junk_pubkey, key_c+32, 32UL ) );
   transfer( b, c, 70UL );
-  starts = b->metrics.connection_attempt_cnt;
   long backoff = b->backoff;
   fd_failover_channel_hangup( c, now );
   for( ulong i=0UL; i<10000UL && paired( b ); i++ ) {
@@ -867,10 +852,10 @@ main( int     argc,
   FD_TEST( b->dial_peer && b->retry_at>=now+backoff && b->retry_at<now+backoff+b->backoff_min );
   now = b->retry_at-1L;
   poll_channel( b );
-  FD_TEST( b->metrics.connection_attempt_cnt==starts );
+  FD_TEST( !fd_failover_channel_pending( b ) );
   now = b->retry_at;
   poll_channel( b );
-  FD_TEST( b->metrics.connection_attempt_cnt==starts+1UL && fd_failover_channel_pending( b )==1UL );
+  FD_TEST( b->state!=FD_FAILOVER_SESSION_LISTENING && fd_failover_channel_pending( b )==1UL );
   fd_failover_channel_init_dialer( c, 0U, 0 );
   fd_failover_channel_init_dialer( b, FD_IP4_ADDR(127,0,0,1), port );
   close( dead_fd );
@@ -892,11 +877,12 @@ main( int     argc,
   poll_channel( b );
   poll_channel( b );
   FD_TEST( fd_failover_channel_pending( b )==16UL );
-  ulong evicted = b->metrics.evicted_cnt;
   fd_failover_channel_init_dialer( b, FD_IP4_ADDR(127,0,0,1), port );
+  poll_channel( b );
+  FD_TEST( b->candidates[0].dialed );
   pump( a, b );
   FD_TEST( paired( a ) && paired( b ) && !fd_failover_channel_pending( b ) );
-  FD_TEST( b->metrics.evicted_cnt==evicted+1UL );
+  FD_TEST( b->paired_idx==0 && b->candidates[0].dialed );
   for( uint i=0; i<16U; i++ ) close( held[i] );
   transfer( a, b, 70UL );
   FD_LOG_NOTICE(( "pass: our dial gets a slot while every slot is held" ));
@@ -913,10 +899,10 @@ main( int     argc,
   poll_channel( a );
   poll_channel( a );
   FD_TEST( fd_failover_channel_pending( a )==16UL );
-  evicted = a->metrics.evicted_cnt;
+  ulong paired_generation = fd_failover_channel_generation( a );
   pump( a, b );
   FD_TEST( paired( a ) && paired( b ) && !fd_failover_channel_pending( a ) );
-  FD_TEST( a->metrics.evicted_cnt==evicted+1UL );
+  FD_TEST( fd_failover_channel_generation( a )==paired_generation+1UL );
   for( uint i=0; i<16U; i++ ) close( held[i] );
   transfer( a, b, 70UL );
   fd_failover_channel_expect_peer( a, 0U );
@@ -953,13 +939,12 @@ main( int     argc,
   poll_channel( a );
   FD_TEST( fd_failover_channel_pending( a )==16UL );
   now += 1999999999L;
-  ulong timeouts = a->metrics.handshake_timeout_cnt;
   poll_channel( a );
   FD_TEST( fd_failover_channel_pending( a )==16UL );
   now++;
   poll_channel( a );
   FD_TEST( !fd_failover_channel_pending( a ) );
-  FD_TEST( a->metrics.handshake_timeout_cnt==timeouts+16UL );
+  for( ulong i=0UL; i<FD_FAILOVER_CHANNEL_CANDIDATE_MAX; i++ ) FD_TEST( a->candidates[i].fd==-1 );
   for( uint i=0; i<20U; i++ ) close( fds[i] );
   FD_LOG_NOTICE(( "pass: accept bound, candidate bound and absolute deadline" ));
 
@@ -996,13 +981,13 @@ main( int     argc,
 
   /* Authenticated stale HELLO rejects only this candidate. */
   now += 2000000001L;
-  b->self_hello.cfg_hash = 1UL;
-  ulong rejects = a->metrics.hello_reject_cnt;
-  for( ulong i=0; i<1000UL && a->metrics.hello_reject_cnt==rejects; i++ ) {
+  b->self_hello.vote_account[0] ^= 1U;
+  a->hello_log_at[FD_FAILOVER_HELLO_ERR_VOTE_ACCT] = 0L;
+  for( ulong i=0; i<1000UL && !a->hello_log_at[FD_FAILOVER_HELLO_ERR_VOTE_ACCT]; i++ ) {
     poll_channel( a ); poll_channel( b ); now += 1000000L; fd_log_sleep( 100000L );
   }
-  FD_TEST( a->metrics.hello_reject_cnt>rejects && a->state==FD_FAILOVER_SESSION_LISTENING );
-  b->self_hello.cfg_hash = 0UL;
+  FD_TEST( a->hello_log_at[FD_FAILOVER_HELLO_ERR_VOTE_ACCT]>now && a->state==FD_FAILOVER_SESSION_LISTENING );
+  b->self_hello.vote_account[0] ^= 1U;
   fd_failover_channel_hangup( b, now );
   now += 2000000001L;
   pump( a, b );
@@ -1023,7 +1008,7 @@ main( int     argc,
   for( ulong i=0UL; i<100000UL && !one; i++ ) {
     poll_channel( a );
     poll_channel( b );
-    one = paired( a ) && paired( b ) && a->candidates[ a->active ].dialed!=b->candidates[ b->active ].dialed;
+    one = paired( a ) && paired( b ) && a->candidates[ a->paired_idx ].dialed!=b->candidates[ b->paired_idx ].dialed;
     now += 100000L;
     fd_log_sleep( 10000L );
   }
