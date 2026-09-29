@@ -160,7 +160,7 @@ failover_control_fn( args_t *        args,
   fd_memset( req, 0, sizeof(*req) );
   req->version = FD_ADMINCTL_FAILOVER_CONTROL_PAYLOAD_VERSION;
   req->cmd     = (ulong)args->failover.cmd;
-  if( FD_UNLIKELY( args->failover.yes && args->failover.cmd==(int)FD_ADMINCTL_FAILOVER_CMD_PROMOTE ) ) {
+  if( FD_UNLIKELY( args->failover.yes ) ) {
     req->flags |= FD_ADMINCTL_FAILOVER_FLAG_YES;
   }
   if( FD_UNLIKELY( args->failover.force ) ) req->flags |= FD_ADMINCTL_FAILOVER_FLAG_FORCE;
