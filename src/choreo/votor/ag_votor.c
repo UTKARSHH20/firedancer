@@ -544,18 +544,29 @@ ag_votor_advance_epoch( ag_votor_t *  self,
   self->ns_per_slot = ns_per_slot;
 }
 
+static ag_votor_epoch_t *
+epoch_starting_at( ag_votor_t * self,
+                   ulong        epoch_slot ) {
+  if( epoch_slot==self->prev_epoch.start_slot ) return &self->prev_epoch;
+  if( epoch_slot==self->curr_epoch.start_slot ) return &self->curr_epoch;
+  if( epoch_slot==self->next_epoch.start_slot ) return &self->next_epoch;
+  FD_LOG_CRIT(( "no epoch starts at slot %lu", epoch_slot ));
+}
+
 void
 ag_votor_set_bls_pubkey( ag_votor_t *  self,
                          ulong         epoch_slot,
                          uchar const * bls_pubkey ) {
-  ag_votor_epoch_t * epoch;
-  if     ( epoch_slot==self->prev_epoch.start_slot ) epoch = &self->prev_epoch;
-  else if( epoch_slot==self->curr_epoch.start_slot ) epoch = &self->curr_epoch;
-  else if( epoch_slot==self->next_epoch.start_slot ) epoch = &self->next_epoch;
-  else FD_LOG_CRIT(( "no epoch starts at slot %lu", epoch_slot ));
-
+  ag_votor_epoch_t * epoch = epoch_starting_at( self, epoch_slot );
   epoch->has_bls_pubkey = !!bls_pubkey;
   if( FD_LIKELY( bls_pubkey ) ) memcpy( epoch->bls_pubkey, bls_pubkey, FD_BLS_PUB_COMPRESSED_SZ );
+}
+
+void
+ag_votor_set_rank( ag_votor_t * self,
+                   ulong        epoch_slot,
+                   ulong        epoch_rank ) {
+  epoch_starting_at( self, epoch_slot )->rank = epoch_rank;
 }
 
 void
@@ -715,4 +726,9 @@ ag_votor_slot_state_max( ag_votor_t const * self ) {
 FD_FN_PURE ulong
 ag_votor_finalized_slot( ag_votor_t const * self ) {
   return self->highest_final_cert_slot;
+}
+
+FD_FN_PURE ulong
+ag_votor_vote_event_cnt( ag_votor_t const * self ) {
+  return vote_events_cnt( self->vote_events );
 }

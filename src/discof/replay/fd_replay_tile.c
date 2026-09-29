@@ -1372,6 +1372,14 @@ try_become_leader_ag( fd_replay_tile_t *  ctx,
   if( FD_UNLIKELY( ctx->halt_leader ) ) return 0;
   if( !ctx->supports_leader ) return 0;
 
+  /* Votor switches identity after replay does, so this slot may have
+     been scheduled for our old identity. */
+  fd_pubkey_t const * leader = fd_multi_epoch_leaders_get_leader_for_slot( ctx->mleaders, ctx->next_leader_slot );
+  if( FD_UNLIKELY( !leader || !fd_pubkey_eq( leader, ctx->identity_pubkey ) ) ) {
+    ctx->next_leader_slot = ULONG_MAX;
+    return 0;
+  }
+
   /* In Alpenglow, the "reset" block is signaled by ParentReady (a state
      transition in the Votor consensus logic).  ParentReady can occur
      ahead of replay, unlike Tower, in which the reset bank has by

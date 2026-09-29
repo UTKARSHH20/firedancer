@@ -456,6 +456,27 @@ ag_pool_advance_epoch( ag_pool_t *             self,
   }
 }
 
+void
+ag_pool_set_rank( ag_pool_t * self,
+                  ulong       epoch_slot,
+                  ulong       epoch_rank ) {
+  if     ( epoch_slot==self->prev_epoch_slot ) self->prev_epoch_rank = epoch_rank;
+  else if( epoch_slot==self->curr_epoch_slot ) self->curr_epoch_rank = epoch_rank;
+  else if( epoch_slot==self->next_epoch_slot ) self->next_epoch_rank = epoch_rank;
+  else FD_LOG_CRIT(( "no epoch starts at slot %lu", epoch_slot ));
+
+  slot_state_map_t * map  = self->slot_states->map;
+  slot_state_ele_t * pool = self->slot_states->pool;
+  for( slot_state_map_iter_t iter = slot_state_map_iter_init( map, pool );
+                                   !slot_state_map_iter_done( iter, map, pool );
+                             iter = slot_state_map_iter_next( iter, map, pool ) ) {
+    ag_slot_state_t * slot_state = &slot_state_map_iter_ele( iter, map, pool )->slot_state;
+    ulong             slot       = slot_state->slot;
+    ulong             rank       = fd_ulong_if( slot>=self->next_epoch_slot, self->next_epoch_rank, fd_ulong_if( slot>=self->curr_epoch_slot, self->curr_epoch_rank, self->prev_epoch_rank ) );
+    if( FD_UNLIKELY( slot_state->own_rank!=rank ) ) ag_slot_state_set_own_rank( slot_state, rank );
+  }
+}
+
 int
 ag_pool_add_cert( ag_pool_t *       self,
                   ag_cert_t const * cert,

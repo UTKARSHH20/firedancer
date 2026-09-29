@@ -67,6 +67,14 @@ ag_votor_set_bls_pubkey( ag_votor_t *  self,
                          ulong         epoch_slot,
                          uchar const * bls_pubkey );
 
+/* Replaces our rank in the epoch starting at epoch_slot, for when our
+   identity changes after the epoch advanced. */
+
+void
+ag_votor_set_rank( ag_votor_t * self,
+                   ulong        epoch_slot,
+                   ulong        epoch_rank );
+
 /* Algorithm 1, lines 9-25. Votor::handle_pool_event */
 
 void
@@ -102,6 +110,7 @@ ag_votor_poll_cert_event( ag_votor_t *      self,
 FD_FN_PURE ulong ag_votor_slot_state_used( ag_votor_t const * self );
 FD_FN_PURE ulong ag_votor_slot_state_max ( ag_votor_t const * self );
 FD_FN_PURE ulong ag_votor_finalized_slot ( ag_votor_t const * self );
+FD_FN_PURE ulong ag_votor_vote_event_cnt ( ag_votor_t const * self );
 
 FD_PROTOTYPES_END
 
