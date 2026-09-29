@@ -3708,6 +3708,46 @@ test_ag_set_identity_leader_slot( fd_wksp_t * wksp,
   FD_LOG_NOTICE(( "pass: test_ag_set_identity_leader_slot(same_identity=%d)", same_identity ));
 }
 
+/* Set-identity can reach replay while it is leader.  If the leader slot
+   ends before housekeeping sees the request, replay switches from the
+   slot end, and must still halt its leader pipeline until the admin
+   tile resumes it. */
+
+static void
+test_set_identity_at_leader_slot_end( fd_wksp_t * wksp ) {
+  static fd_replay_tile_t ctx[ 1 ];
+  setup_ctx( ctx, wksp );
+  setup_node_info( ctx );
+
+  static fd_keyswitch_t keyswitch[ 1 ];
+  ctx->keyswitch = fd_keyswitch_join( fd_keyswitch_new( keyswitch, FD_KEYSWITCH_STATE_UNLOCKED ) );
+  FD_TEST( ctx->keyswitch );
+  void * vote_tracker_mem = fd_wksp_alloc_laddr( wksp, fd_vote_tracker_align(), fd_vote_tracker_footprint(), 1UL );
+  FD_TEST( vote_tracker_mem );
+  ctx->vote_tracker = fd_vote_tracker_join( fd_vote_tracker_new( vote_tracker_mem, 42UL ) );
+  FD_TEST( ctx->vote_tracker );
+
+  fd_hash_t mr_root = { .ul = { 100UL } };
+  init_root_fec( ctx, &mr_root );
+  drive_become_leader( ctx, &mr_root, 1UL );
+
+  fd_pubkey_t new_identity = { .ul = { 2UL } };
+  memcpy( keyswitch->bytes, new_identity.uc, sizeof(fd_pubkey_t) );
+  fd_keyswitch_state( keyswitch, FD_KEYSWITCH_STATE_SWITCH_PENDING );
+
+  fd_poh_leader_slot_ended_t slot_ended = { .completed = 0, .slot = 1UL };
+  process_poh_message( ctx, test_stem, &slot_ended );
+  FD_TEST( !ctx->is_leader && keyswitch->state==FD_KEYSWITCH_STATE_COMPLETED );
+  FD_TEST( fd_pubkey_eq( ctx->identity_pubkey, &new_identity ) );
+  FD_TEST( ctx->halt_leader );
+
+  fd_keyswitch_state( keyswitch, FD_KEYSWITCH_STATE_UNHALT_PENDING );
+  during_housekeeping( ctx );
+  FD_TEST( !ctx->halt_leader && keyswitch->state==FD_KEYSWITCH_STATE_COMPLETED );
+
+  FD_LOG_NOTICE(( "pass: test_set_identity_at_leader_slot_end" ));
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -3756,6 +3796,7 @@ main( int     argc,
   test_rotor_fec_turbine_keying( wksp );            fd_wksp_reset( wksp, 42U );
   test_ag_set_identity_leader_slot( wksp, 1 );      fd_wksp_reset( wksp, 42U );
   test_ag_set_identity_leader_slot( wksp, 0 );      fd_wksp_reset( wksp, 42U );
+  test_set_identity_at_leader_slot_end( wksp );     fd_wksp_reset( wksp, 42U );
   test_dead_block_children_drop( wksp );
   test_stale_id_key_does_not_shadow_rebuild( wksp );
 

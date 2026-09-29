@@ -1257,7 +1257,9 @@ maybe_switch_identity( fd_replay_tile_t * ctx ) {
 
   /* Switch identity */
 
-  FD_LOG_DEBUG(( "keyswitch: switching identity" ));
+  FD_LOG_DEBUG(( "keyswitch: switching identity and halting leader" ));
+
+  ctx->halt_leader = 1;
 
   memcpy( ctx->identity_pubkey, ctx->keyswitch->bytes, 32UL );
   ctx->identity_dirty = 1;
@@ -5310,8 +5312,6 @@ during_housekeeping( fd_replay_tile_t * ctx ) {
   }
 
   if( FD_UNLIKELY( fd_keyswitch_state_query( ctx->keyswitch )==FD_KEYSWITCH_STATE_SWITCH_PENDING ) ) {
-    FD_LOG_DEBUG(( "keyswitch: halting leader" ));
-    ctx->halt_leader = 1;
     if( !ctx->is_leader ) maybe_switch_identity( ctx );
   }
 }
