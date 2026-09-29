@@ -219,6 +219,7 @@ test_publish_slot_done_identity_mismatch( void ) {
   publish_slot_done( ctx, &sc, &out, 1, 100UL, 10000U, 0UL, NULL );
   pub = publishes_peek_head( ctx->publishes );
   FD_TEST( pub->msg.slot_done.has_vote_txn==0 );
+  FD_TEST( pub->msg.slot_done.is_voting==0 );
   publishes_pop_head_nocopy( ctx->publishes );
   ctx->failover_standby = 0;
 
@@ -227,6 +228,7 @@ test_publish_slot_done_identity_mismatch( void ) {
   publish_slot_done( ctx, &sc, &out, 1, 100UL, 10000U, 0UL, NULL );
   pub = publishes_peek_head( ctx->publishes );
   FD_TEST( pub->msg.slot_done.has_vote_txn==0 );
+  FD_TEST( pub->msg.slot_done.is_voting==0 );
   publishes_pop_head_nocopy( ctx->publishes );
   ctx->no_vote_authority = 0;
 
