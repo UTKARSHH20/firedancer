@@ -110,9 +110,7 @@ FD_STATIC_ASSERT( FD_VM_ALT_BN128_G2_COMPRESS                    ==             
 FD_STATIC_ASSERT( FD_VM_ALT_BN128_G2_DECOMPRESS                  ==           13610UL, vm_cu );
 FD_STATIC_ASSERT( FD_VM_LOADED_ACCOUNTS_DATA_SIZE_LIMIT          ==64UL*1024UL*1024UL, vm_cu );
 
-FD_STATIC_ASSERT( FD_VM_TRACE_EVENT_TYPE_EXE   ==0, vm_trace );
-FD_STATIC_ASSERT( FD_VM_TRACE_EVENT_TYPE_READ  ==1, vm_trace );
-FD_STATIC_ASSERT( FD_VM_TRACE_EVENT_TYPE_WRITE ==2, vm_trace );
+
 
 int
 main( int     argc,
@@ -232,14 +230,7 @@ main( int     argc,
   FD_TEST( fd_vm_trace_event_max     ( trace )==event_max      );
   FD_TEST( fd_vm_trace_event_data_max( trace )==event_data_max );
 
-  /* Test trace info */
 
-  for( int type=0; type<3; type++ )
-    for( int valid=0; valid<2; valid++ ) {
-      ulong info = fd_vm_trace_event_info( type, valid );
-      FD_TEST( fd_vm_trace_event_info_type ( info )==type  );
-      FD_TEST( fd_vm_trace_event_info_valid( info )==valid );
-    }
 
   /* Test tracing */
 
@@ -249,41 +240,14 @@ main( int     argc,
   text[1] = fd_rng_ulong( rng );
 
   FD_TEST( fd_vm_trace_event_exe( NULL, reg[0UL] & 0xffffUL, reg[1UL] & 0xffffUL, reg[2UL], reg+3UL, text, 2UL, 6UL, 4UL )==FD_VM_ERR_INVAL );
-  FD_TEST( fd_vm_trace_event_mem( NULL, 1, 2UL, 3UL, reg                                                                 )==FD_VM_ERR_INVAL );
 
   for(;;) {
-    uint r = fd_rng_uint( rng );
-    int type = (int)(r & 1U); r >>= 1;
-    switch( type ) {
-
-    default:
-    case 0: { /* exe */
-      for( ulong i=0UL; i<3UL+FD_VM_REG_CNT; i++ ) reg[i] = fd_rng_ulong( rng );
-      text[0] = fd_rng_ulong( rng );
-      text[1] = fd_rng_ulong( rng );
-      int err = fd_vm_trace_event_exe( trace, reg[0UL] & 0xffffUL, reg[1UL] & 0xffffUL, reg[2UL], reg+3UL, text, 2UL, 7UL, 4UL );
-      if( FD_UNLIKELY( err==FD_VM_ERR_FULL ) ) goto vm_trace_done;
-      FD_TEST( !err );
-      break;
-    }
-
-    case 1: { /* mem */
-      int   write = (int)  (r &   1U); r >>= 1;
-      int   null  = (int)  (r &   1U); r >>= 1;
-      uchar byte  = (uchar)(r & 255U); r >>= 8;
-      ulong vaddr = fd_rng_ulong( rng );
-      ulong sz    = fd_rng_ulong( rng ) & 127UL;
-      uchar msg[128];
-      for( ulong off=0UL; off<sz; off++ ) msg[off] = (byte++);
-      void * data = null ? NULL : msg;
-
-      int err = fd_vm_trace_event_mem( trace, write, vaddr, sz, data );
-      if( FD_UNLIKELY( err==FD_VM_ERR_FULL ) ) goto vm_trace_done;
-      FD_TEST( !err );
-      break;
-    }
-
-    }
+    for( ulong i=0UL; i<3UL+FD_VM_REG_CNT; i++ ) reg[i] = fd_rng_ulong( rng );
+    text[0] = fd_rng_ulong( rng );
+    text[1] = fd_rng_ulong( rng );
+    int err = fd_vm_trace_event_exe( trace, reg[0UL] & 0xffffUL, reg[1UL] & 0xffffUL, reg[2UL], reg+3UL, text, 2UL, 7UL, 4UL );
+    if( FD_UNLIKELY( err==FD_VM_ERR_FULL ) ) goto vm_trace_done;
+    FD_TEST( !err );
   }
 
 vm_trace_done:
